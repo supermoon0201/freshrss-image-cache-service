@@ -33,6 +33,9 @@
 | `UPSTREAM_CONCURRENCY` | `64` | 同时抓取上游资源的并发上限 |
 | `UPSTREAM_CONCURRENCY_PER_HOST` | `8` | 单个上游 host 的并发抓取上限 |
 | `META_CACHE_ENTRIES` | `4096` | 进程内元数据 LRU 容量 |
+| `BLOB_CACHE_ENTRIES` | `256` | 进程内小文件 blob LRU 的最大条目数 |
+| `BLOB_CACHE_MAX_BYTES` | `67108864` | 进程内小文件 blob LRU 的总字节上限，默认 64MB |
+| `BLOB_FILE_MAX_BYTES` | `524288` | 单个响应体进入 blob 内存缓存的最大字节数，默认 512KB |
 | `STALE_GRACE_PERIOD` | `10m` | 缓存过期后仍可返回旧内容并后台刷新的宽限时间 |
 | `WARM_META_ON_START` | `true` | 启动后是否异步预热磁盘元数据到内存 |
 | `WARM_META_ENTRIES` | `2048` | 启动预热最多加载的元数据条目数 |

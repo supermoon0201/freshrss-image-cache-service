@@ -43,6 +43,9 @@ type Config struct {
 	UpstreamConcurrency int
 	PerHostConcurrency  int
 	MetaCacheEntries    int
+	BlobCacheEntries    int
+	BlobCacheMaxBytes   int64
+	BlobFileMaxBytes    int64
 	StaleGracePeriod    time.Duration
 	WarmMetaOnStart     bool
 	WarmMetaEntries     int
@@ -96,12 +99,18 @@ type Server struct {
 	metaCacheMu      sync.RWMutex
 	metaCache        map[string]*list.Element
 	metaCacheList    *list.List
+	blobCacheMu      sync.RWMutex
+	blobCache        map[string]*list.Element
+	blobCacheList    *list.List
+	blobCacheBytes   int64
 	hostFetchMu      sync.Mutex
 	hostFetchSem     map[string]chan struct{}
 	janitorMu        sync.Mutex
 	janitorCursor    int
 	copyBufferPool   sync.Pool
 	metaDiskReadHook func(string)
+	blobDiskReadHook func(string)
+	ensureCachedHook func(string)
 }
 
 // metaCacheEntry 是 LRU 链表里的节点内容。
@@ -109,6 +118,13 @@ type Server struct {
 type metaCacheEntry struct {
 	Key  string
 	Meta Meta
+}
+
+// blobCacheEntry 保存“小而热”的图片内容。
+// 这样高并发命中时可以直接从内存回写，减少磁盘打开和读取。
+type blobCacheEntry struct {
+	Key  string
+	Blob []byte
 }
 
 type cacheResult struct {
@@ -205,6 +221,9 @@ func NewServer(cfg Config) (*Server, error) {
 	cfg.UpstreamConcurrency = upstreamConcurrency
 	cfg.PerHostConcurrency = normalizePositive(cfg.PerHostConcurrency, minInt(8, upstreamConcurrency))
 	cfg.MetaCacheEntries = normalizePositive(cfg.MetaCacheEntries, 4096)
+	cfg.BlobCacheEntries = normalizePositive(cfg.BlobCacheEntries, 256)
+	cfg.BlobCacheMaxBytes = normalizePositiveInt64(cfg.BlobCacheMaxBytes, 64<<20)
+	cfg.BlobFileMaxBytes = normalizePositiveInt64(cfg.BlobFileMaxBytes, 512<<10)
 	cfg.JanitorShardBatch = normalizePositive(cfg.JanitorShardBatch, 32)
 	// 这里显式放大连接池，避免高并发 miss 时卡在连接建立与复用上。
 	transport := &http.Transport{
@@ -227,6 +246,8 @@ func NewServer(cfg Config) (*Server, error) {
 		fetchSem:      make(chan struct{}, upstreamConcurrency),
 		metaCache:     make(map[string]*list.Element),
 		metaCacheList: list.New(),
+		blobCache:     make(map[string]*list.Element),
+		blobCacheList: list.New(),
 		hostFetchSem:  make(map[string]chan struct{}),
 		// 下载上游文件时复用固定大小的缓冲区，减少频繁分配。
 		copyBufferPool: sync.Pool{
@@ -296,6 +317,13 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, headOnly boo
 
 	effective := s.resolveFetchOptions(normalizedURL, forwardedOptions)
 	cacheKey := s.cacheKey(normalizedURL, effective.CacheVariant)
+	if result, ok := s.tryServeFreshCacheHit(cacheKey); ok {
+		w.Header().Set("X-Piccache-Status", result.Status)
+		if err := s.writeReadResponse(w, r, cacheKey, result, headOnly); err != nil {
+			http.Error(w, "cache file missing", http.StatusNotFound)
+		}
+		return
+	}
 
 	// 同一个 key 在同一时刻只允许一个 goroutine 真正落到 ensureCached，
 	// 其余并发请求直接等待共享结果。
@@ -317,14 +345,31 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, headOnly boo
 	} else {
 		w.Header().Set("X-Piccache-Status", result.Status)
 	}
+	if err := s.writeReadResponse(w, r, cacheKey, result, headOnly); err != nil {
+		http.Error(w, "cache file missing", http.StatusNotFound)
+	}
+}
 
+// tryServeFreshCacheHit 专门处理“已经在本地而且没过期”的最快命中路径。
+// 这类请求不需要再进入 ensureCached 和 singleflight，共享锁竞争会更少。
+func (s *Server) tryServeFreshCacheHit(cacheKey string) (cacheResult, bool) {
+	meta, ok := s.readMeta(cacheKey)
+	if !ok || s.isExpired(meta) {
+		return cacheResult{}, false
+	}
+	return cacheResult{Meta: meta, Status: "HIT"}, true
+}
+
+// writeReadResponse 统一回写 GET / HEAD 的响应头和 body。
+// 这样 fast path 和常规路径可以共用一套输出逻辑，避免响应细节漂移。
+func (s *Server) writeReadResponse(w http.ResponseWriter, r *http.Request, cacheKey string, result cacheResult, headOnly bool) error {
 	w.Header().Set("Content-Type", result.Meta.ContentType)
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	if result.Meta.ETag != "" {
 		w.Header().Set("ETag", result.Meta.ETag)
 		if match := strings.TrimSpace(r.Header.Get("If-None-Match")); match == result.Meta.ETag {
 			w.WriteHeader(http.StatusNotModified)
-			return
+			return nil
 		}
 	}
 	w.Header().Set("Last-Modified", result.Meta.CreatedAt.UTC().Format(http.TimeFormat))
@@ -332,13 +377,11 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, headOnly boo
 	if headOnly {
 		w.Header().Set("Content-Length", strconv.FormatInt(result.Meta.Length, 10))
 		w.WriteHeader(http.StatusOK)
-		return
+		return nil
 	}
 
 	// 不再使用 http.ServeFile，避免它再次做文件探测和额外的 stat。
-	if err := s.serveCachedBlob(w, r, cacheKey, result.Meta); err != nil {
-		http.Error(w, "cache file missing", http.StatusNotFound)
-	}
+	return s.serveCachedBlob(w, cacheKey, result.Meta)
 }
 
 // handlePost 提供主动预热接口。
@@ -404,6 +447,9 @@ func (s *Server) normalizeURL(raw string) (string, error) {
 // 它要在“磁盘缓存是否命中”“是否已过期”“是否允许返回 stale”
 // “是否需要真实回源”之间做选择。
 func (s *Server) ensureCached(ctx context.Context, normalizedURL string, forwarded upstreamFetchOptions) (cacheResult, error) {
+	if s.ensureCachedHook != nil {
+		s.ensureCachedHook(normalizedURL)
+	}
 	effective := s.resolveFetchOptions(normalizedURL, forwarded)
 	if !effective.Cacheable {
 		// 私有抓取（带 Cookie / Authorization）不会进共享磁盘缓存，
@@ -515,8 +561,9 @@ func (s *Server) fetchAndStore(ctx context.Context, normalizedURL string, option
 
 	// 多读 1 个字节，用来判断是否超过配置的最大体积限制。
 	limitedBody := io.LimitReader(bodyReader, s.cfg.MaxBodyBytes+1)
+	capture := &blobCapture{limit: s.cfg.BlobFileMaxBytes}
 	bufPtr := s.copyBufferPool.Get().(*[]byte)
-	written, copyErr := io.CopyBuffer(out, limitedBody, *bufPtr)
+	written, copyErr := io.CopyBuffer(io.MultiWriter(out, capture), limitedBody, *bufPtr)
 	s.copyBufferPool.Put(bufPtr)
 	closeErr := out.Close()
 	if copyErr != nil || closeErr != nil {
@@ -552,6 +599,7 @@ func (s *Server) fetchAndStore(ctx context.Context, normalizedURL string, option
 		return Meta{}, false, err
 	}
 	s.writeMetaToMemory(cacheKey, meta)
+	s.writeBlobToMemory(cacheKey, capture.blob(written))
 	log.Printf("upstream fetch ok url=%s mode=%s cache=public", normalizedURL, options.Mode)
 	return meta, false, nil
 }
@@ -700,6 +748,7 @@ func (s *Server) deleteMetaCache(cacheKey string) {
 		delete(s.metaCache, cacheKey)
 	}
 	s.metaCacheMu.Unlock()
+	s.deleteBlobCache(cacheKey)
 }
 
 // conditionalHeaders 根据旧元数据生成条件回源头。
@@ -753,16 +802,153 @@ func (s *Server) canServeStale(cacheKey string, meta Meta) bool {
 
 // serveCachedBlob 直接把缓存文件流式写回客户端。
 // 之所以单独实现，是为了避免 ServeFile 自己再做一轮文件探测。
-func (s *Server) serveCachedBlob(w http.ResponseWriter, _ *http.Request, cacheKey string, meta Meta) error {
+func (s *Server) serveCachedBlob(w http.ResponseWriter, cacheKey string, meta Meta) error {
+	w.Header().Set("Content-Length", strconv.FormatInt(meta.Length, 10))
+	w.WriteHeader(http.StatusOK)
+
+	if blob, ok := s.readBlobFromMemory(cacheKey); ok {
+		_, err := w.Write(blob)
+		return err
+	}
+
+	if s.shouldCacheBlob(meta.Length) {
+		blob, err := s.readBlobFromDisk(cacheKey, meta.Length)
+		if err != nil {
+			return err
+		}
+		s.writeBlobToMemory(cacheKey, blob)
+		_, err = w.Write(blob)
+		return err
+	}
+
 	file, err := os.Open(s.blobPath(cacheKey))
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	w.Header().Set("Content-Length", strconv.FormatInt(meta.Length, 10))
-	w.WriteHeader(http.StatusOK)
 	_, err = io.Copy(w, file)
 	return err
+}
+
+// shouldCacheBlob 判断这份响应体是否值得放进进程内存。
+// 这里只缓存“小文件”，避免 500 个几百 KB 请求把磁盘热路径放大成 I/O 瓶颈。
+func (s *Server) shouldCacheBlob(length int64) bool {
+	return s.cfg.BlobCacheEntries > 0 &&
+		s.cfg.BlobCacheMaxBytes > 0 &&
+		s.cfg.BlobFileMaxBytes > 0 &&
+		length > 0 &&
+		length <= s.cfg.BlobFileMaxBytes
+}
+
+// readBlobFromMemory 从 LRU 中取热点小文件。
+func (s *Server) readBlobFromMemory(cacheKey string) ([]byte, bool) {
+	s.blobCacheMu.RLock()
+	_, ok := s.blobCache[cacheKey]
+	s.blobCacheMu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+
+	s.blobCacheMu.Lock()
+	defer s.blobCacheMu.Unlock()
+	current, ok := s.blobCache[cacheKey]
+	if !ok {
+		return nil, false
+	}
+	s.blobCacheList.MoveToFront(current)
+	entry := current.Value.(*blobCacheEntry)
+	return entry.Blob, true
+}
+
+// writeBlobToMemory 把小文件内容写进 LRU，并按条目数和总字节数做双重淘汰。
+func (s *Server) writeBlobToMemory(cacheKey string, blob []byte) {
+	if len(blob) == 0 || !s.shouldCacheBlob(int64(len(blob))) {
+		return
+	}
+
+	s.blobCacheMu.Lock()
+	defer s.blobCacheMu.Unlock()
+	if element, ok := s.blobCache[cacheKey]; ok {
+		entry := element.Value.(*blobCacheEntry)
+		s.blobCacheBytes += int64(len(blob) - len(entry.Blob))
+		entry.Blob = append(entry.Blob[:0], blob...)
+		s.blobCacheList.MoveToFront(element)
+	} else {
+		copied := append([]byte(nil), blob...)
+		entry := &blobCacheEntry{Key: cacheKey, Blob: copied}
+		element := s.blobCacheList.PushFront(entry)
+		s.blobCache[cacheKey] = element
+		s.blobCacheBytes += int64(len(copied))
+	}
+
+	for s.blobCacheList.Len() > s.cfg.BlobCacheEntries || s.blobCacheBytes > s.cfg.BlobCacheMaxBytes {
+		tail := s.blobCacheList.Back()
+		if tail == nil {
+			break
+		}
+		entry := tail.Value.(*blobCacheEntry)
+		s.blobCacheBytes -= int64(len(entry.Blob))
+		s.blobCacheList.Remove(tail)
+		delete(s.blobCache, entry.Key)
+	}
+}
+
+func (s *Server) deleteBlobCache(cacheKey string) {
+	s.blobCacheMu.Lock()
+	defer s.blobCacheMu.Unlock()
+	if element, ok := s.blobCache[cacheKey]; ok {
+		entry := element.Value.(*blobCacheEntry)
+		s.blobCacheBytes -= int64(len(entry.Blob))
+		s.blobCacheList.Remove(element)
+		delete(s.blobCache, cacheKey)
+	}
+}
+
+func (s *Server) readBlobFromDisk(cacheKey string, expectedLength int64) ([]byte, error) {
+	if s.blobDiskReadHook != nil {
+		s.blobDiskReadHook(cacheKey)
+	}
+	blob, err := os.ReadFile(s.blobPath(cacheKey))
+	if err != nil {
+		return nil, err
+	}
+	if expectedLength > 0 && int64(len(blob)) != expectedLength {
+		return nil, fmt.Errorf("cache blob size mismatch: got %d want %d", len(blob), expectedLength)
+	}
+	return blob, nil
+}
+
+type blobCapture struct {
+	limit    int64
+	buffer   bytes.Buffer
+	overflow bool
+}
+
+func (c *blobCapture) Write(p []byte) (int, error) {
+	if c.limit <= 0 || c.overflow {
+		c.overflow = true
+		return len(p), nil
+	}
+
+	remaining := c.limit - int64(c.buffer.Len())
+	if remaining <= 0 {
+		c.overflow = true
+		return len(p), nil
+	}
+	if int64(len(p)) > remaining {
+		_, _ = c.buffer.Write(p[:remaining])
+		c.overflow = true
+		return len(p), nil
+	}
+	_, _ = c.buffer.Write(p)
+	return len(p), nil
+}
+
+func (c *blobCapture) blob(written int64) []byte {
+	if c.overflow || written != int64(c.buffer.Len()) {
+		return nil
+	}
+	return c.buffer.Bytes()
 }
 
 // refreshStaleCache 在后台异步刷新 stale 缓存。
@@ -1549,6 +1735,9 @@ func defaultConfig() Config {
 		UpstreamConcurrency: int(parseInt64OrDefault("UPSTREAM_CONCURRENCY", 64)),
 		PerHostConcurrency:  int(parseInt64OrDefault("UPSTREAM_CONCURRENCY_PER_HOST", 8)),
 		MetaCacheEntries:    int(parseInt64OrDefault("META_CACHE_ENTRIES", 4096)),
+		BlobCacheEntries:    int(parseInt64OrDefault("BLOB_CACHE_ENTRIES", 256)),
+		BlobCacheMaxBytes:   parseInt64OrDefault("BLOB_CACHE_MAX_BYTES", 64<<20), // 64MB
+		BlobFileMaxBytes:    parseInt64OrDefault("BLOB_FILE_MAX_BYTES", 512<<10), // 512KB
 		StaleGracePeriod:    parseDurationOrDefault("STALE_GRACE_PERIOD", 10*time.Minute),
 		WarmMetaOnStart:     parseBoolOrDefault("WARM_META_ON_START", true),
 		WarmMetaEntries:     int(parseInt64OrDefault("WARM_META_ENTRIES", 2048)),
@@ -1569,6 +1758,13 @@ func normalizeUpstreamConcurrency(value int) int {
 
 // normalizePositive 保证正整数配置项至少回退到给定默认值。
 func normalizePositive(value, fallback int) int {
+	if value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func normalizePositiveInt64(value, fallback int64) int64 {
 	if value <= 0 {
 		return fallback
 	}

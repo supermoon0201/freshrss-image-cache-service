@@ -571,6 +571,113 @@ func TestHandleGetServesCachedBlobWithoutServeFile(t *testing.T) {
 	}
 }
 
+// TestHandleGetFreshHitSkipsEnsureCached 验证“未过期的本地命中”会直接走快速路径，
+// 不再进入 ensureCached 和 singleflight 慢路径。
+func TestHandleGetFreshHitSkipsEnsureCached(t *testing.T) {
+	server := newTestServer(t)
+	targetURL := "https://example.com/fresh.png"
+	options := server.resolveFetchOptions(targetURL, upstreamFetchOptions{})
+	cacheKey := server.cacheKey(targetURL, options.CacheVariant)
+	body := minimalPNG()
+	now := time.Now().UTC()
+	meta := Meta{
+		SourceURL:   targetURL,
+		ContentType: "image/png",
+		Length:      int64(len(body)),
+		CreatedAt:   now,
+		ETag:        buildETag(cacheKey, int64(len(body)), now),
+	}
+	if err := os.MkdirAll(filepath.Dir(server.blobPath(cacheKey)), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(server.blobPath(cacheKey), body, 0o644); err != nil {
+		t.Fatalf("WriteFile blob returned error: %v", err)
+	}
+	if err := writeJSONAtomic(server.metaPath(cacheKey), meta); err != nil {
+		t.Fatalf("writeJSONAtomic returned error: %v", err)
+	}
+	server.writeMetaToMemory(cacheKey, meta)
+
+	var ensureCalls atomic.Int32
+	server.ensureCachedHook = func(string) {
+		ensureCalls.Add(1)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/piccache?url="+targetURL, nil)
+	rec := httptest.NewRecorder()
+	server.handleGet(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := ensureCalls.Load(); got != 0 {
+		t.Fatalf("ensureCached calls = %d, want 0", got)
+	}
+	if got := rec.Header().Get("X-Piccache-Status"); got != "HIT" {
+		t.Fatalf("X-Piccache-Status = %q, want HIT", got)
+	}
+}
+
+// TestHandleGetCachesSmallBlobInMemory 验证热点小文件第一次读盘后会进入内存 blob LRU，
+// 第二次命中直接从内存返回，不再重复读磁盘。
+func TestHandleGetCachesSmallBlobInMemory(t *testing.T) {
+	server := newTestServer(t)
+	server.cfg.BlobCacheEntries = 8
+	server.cfg.BlobCacheMaxBytes = 1 << 20
+	server.cfg.BlobFileMaxBytes = 1 << 20
+
+	targetURL := "https://example.com/hot-small.png"
+	options := server.resolveFetchOptions(targetURL, upstreamFetchOptions{})
+	cacheKey := server.cacheKey(targetURL, options.CacheVariant)
+	body := minimalPNG()
+	now := time.Now().UTC()
+	meta := Meta{
+		SourceURL:   targetURL,
+		ContentType: "image/png",
+		Length:      int64(len(body)),
+		CreatedAt:   now,
+		ETag:        buildETag(cacheKey, int64(len(body)), now),
+	}
+	if err := os.MkdirAll(filepath.Dir(server.blobPath(cacheKey)), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(server.blobPath(cacheKey), body, 0o644); err != nil {
+		t.Fatalf("WriteFile blob returned error: %v", err)
+	}
+	if err := writeJSONAtomic(server.metaPath(cacheKey), meta); err != nil {
+		t.Fatalf("writeJSONAtomic returned error: %v", err)
+	}
+	server.writeMetaToMemory(cacheKey, meta)
+
+	var diskReads atomic.Int32
+	server.blobDiskReadHook = func(string) {
+		diskReads.Add(1)
+	}
+
+	firstReq := httptest.NewRequest(http.MethodGet, "/piccache?url="+targetURL, nil)
+	firstRec := httptest.NewRecorder()
+	server.handleGet(firstRec, firstReq)
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("first GET status = %d, want 200; body=%s", firstRec.Code, firstRec.Body.String())
+	}
+	if got := diskReads.Load(); got != 1 {
+		t.Fatalf("disk reads after first GET = %d, want 1", got)
+	}
+
+	secondReq := httptest.NewRequest(http.MethodGet, "/piccache?url="+targetURL, nil)
+	secondRec := httptest.NewRecorder()
+	server.handleGet(secondRec, secondReq)
+	if secondRec.Code != http.StatusOK {
+		t.Fatalf("second GET status = %d, want 200; body=%s", secondRec.Code, secondRec.Body.String())
+	}
+	if got := secondRec.Body.Bytes(); !bytes.Equal(got, body) {
+		t.Fatalf("second GET body mismatch")
+	}
+	if got := diskReads.Load(); got != 1 {
+		t.Fatalf("disk reads after second GET = %d, want 1", got)
+	}
+}
+
 // TestEnsureCachedServesStaleAndRefreshesInBackground 验证 stale-while-revalidate：
 // 请求先拿到旧内容，后台再异步刷新元数据和文件。
 func TestEnsureCachedServesStaleAndRefreshesInBackground(t *testing.T) {
