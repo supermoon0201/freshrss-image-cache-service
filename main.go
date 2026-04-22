@@ -36,6 +36,18 @@ type Config struct {
 	MaxCacheBytes       int64
 	UpstreamConcurrency int
 	AllowedSchemes      map[string]struct{}
+	UpstreamHeaderRules []UpstreamHeaderRule
+	CredentialedHosts   []string
+}
+
+type UpstreamHeaderRule struct {
+	Name           string            `json:"name"`
+	Hosts          []string          `json:"hosts"`
+	Referer        string            `json:"referer"`
+	Origin         string            `json:"origin"`
+	UserAgent      string            `json:"user_agent"`
+	AcceptLanguage string            `json:"accept_language"`
+	Headers        map[string]string `json:"headers"`
 }
 
 // Meta 存放缓存元数据。
@@ -62,8 +74,24 @@ type cacheResult struct {
 
 // proactiveRequest 对应 FreshRSS proactive cache 的请求体。
 type proactiveRequest struct {
-	URL         string `json:"url"`
-	AccessToken string `json:"access_token"`
+	URL             string            `json:"url"`
+	AccessToken     string            `json:"access_token"`
+	UpstreamHeaders map[string]string `json:"upstream_headers"`
+}
+
+type fetchMode string
+
+const (
+	fetchModeAnonymous fetchMode = "anonymous"
+	fetchModeRule      fetchMode = "rule"
+	fetchModeForwarded fetchMode = "forwarded"
+)
+
+type upstreamFetchOptions struct {
+	Headers      map[string]string
+	CacheVariant string
+	Cacheable    bool
+	Mode         fetchMode
 }
 
 // FlightGroup 是最小版 singleflight。
@@ -130,6 +158,8 @@ func main() {
 		MaxCacheBytes:       parseInt64OrDefault("MAX_CACHE_BYTES", 10<<30), // 10GB
 		UpstreamConcurrency: int(parseInt64OrDefault("UPSTREAM_CONCURRENCY", 16)),
 		AllowedSchemes:      map[string]struct{}{"http": {}, "https": {}},
+		UpstreamHeaderRules: parseUpstreamHeaderRules("UPSTREAM_HEADER_RULES_JSON"),
+		CredentialedHosts:   parseCSVEnv("CREDENTIAL_FORWARD_HOSTS"),
 	}
 
 	server, err := NewServer(cfg)
@@ -189,6 +219,8 @@ func (s *Server) handlePiccache(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		s.handleGet(w, r)
+	case http.MethodHead:
+		s.handleHead(w, r)
 	case http.MethodPost:
 		s.handlePost(w, r)
 	default:
@@ -197,6 +229,14 @@ func (s *Server) handlePiccache(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
+	s.handleRead(w, r, false)
+}
+
+func (s *Server) handleHead(w http.ResponseWriter, r *http.Request) {
+	s.handleRead(w, r, true)
+}
+
+func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, headOnly bool) {
 	rawURL := strings.TrimSpace(r.URL.Query().Get("url"))
 	if rawURL == "" {
 		http.Error(w, "missing url", http.StatusBadRequest)
@@ -209,8 +249,17 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	value, err, shared := s.group.Do(normalizedURL, func() (any, error) {
-		return s.ensureCached(r.Context(), normalizedURL)
+	forwardedOptions, err := s.buildForwardedOptionsFromRequest(normalizedURL, r.Header, false)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	effective := s.resolveFetchOptions(normalizedURL, forwardedOptions)
+	cacheKey := s.cacheKey(normalizedURL, effective.CacheVariant)
+
+	value, err, shared := s.group.Do(cacheKey, func() (any, error) {
+		return s.ensureCached(r.Context(), normalizedURL, forwardedOptions)
 	})
 	if err != nil {
 		statusCode := http.StatusBadGateway
@@ -239,7 +288,13 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Last-Modified", result.Meta.CreatedAt.UTC().Format(http.TimeFormat))
 
-	http.ServeFile(w, r, s.blobPath(normalizedURL))
+	if headOnly {
+		w.Header().Set("Content-Length", strconv.FormatInt(result.Meta.Length, 10))
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	http.ServeFile(w, r, s.blobPath(cacheKey))
 }
 
 func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
@@ -261,7 +316,13 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := s.ensureCached(r.Context(), normalizedURL); err != nil {
+	forwardedOptions, err := s.buildForwardedOptions(normalizedURL, req.UpstreamHeaders)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if _, err := s.ensureCached(r.Context(), normalizedURL, forwardedOptions); err != nil {
 		statusCode := http.StatusBadGateway
 		if errors.Is(err, errPrivateAddress) {
 			statusCode = http.StatusForbidden
@@ -289,9 +350,20 @@ func (s *Server) normalizeURL(raw string) (string, error) {
 	return parsed.String(), nil
 }
 
-func (s *Server) ensureCached(ctx context.Context, normalizedURL string) (cacheResult, error) {
+func (s *Server) ensureCached(ctx context.Context, normalizedURL string, forwarded upstreamFetchOptions) (cacheResult, error) {
+	effective := s.resolveFetchOptions(normalizedURL, forwarded)
+	if !effective.Cacheable {
+		meta, err := s.fetchAndStore(ctx, normalizedURL, effective)
+		if err != nil {
+			return cacheResult{}, err
+		}
+		return cacheResult{Meta: meta, Status: "MISS"}, nil
+	}
+
+	cacheKey := s.cacheKey(normalizedURL, effective.CacheVariant)
+
 	// 命中且未过期，直接返回。
-	if meta, ok := s.readMeta(normalizedURL); ok && !s.isExpired(meta) {
+	if meta, ok := s.readMeta(cacheKey); ok && !s.isExpired(meta) {
 		return cacheResult{Meta: meta, Status: "HIT"}, nil
 	}
 
@@ -304,31 +376,27 @@ func (s *Server) ensureCached(ctx context.Context, normalizedURL string) (cacheR
 	}
 
 	// 双检，避免并发下重复下载。
-	if meta, ok := s.readMeta(normalizedURL); ok && !s.isExpired(meta) {
+	if meta, ok := s.readMeta(cacheKey); ok && !s.isExpired(meta) {
 		return cacheResult{Meta: meta, Status: "HIT"}, nil
 	}
 
-	meta, err := s.fetchAndStore(ctx, normalizedURL)
+	meta, err := s.fetchAndStore(ctx, normalizedURL, effective)
 	if err != nil {
 		return cacheResult{}, err
 	}
 	return cacheResult{Meta: meta, Status: "MISS"}, nil
 }
 
-func (s *Server) fetchAndStore(ctx context.Context, normalizedURL string) (Meta, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, normalizedURL, nil)
-	if err != nil {
-		return Meta{}, err
-	}
-	req.Header.Set("User-Agent", "piccache/1.0")
-	req.Header.Set("Accept", "image/*,video/*,*/*;q=0.8")
-
-	resp, err := s.httpClient.Do(req)
+func (s *Server) fetchAndStore(ctx context.Context, normalizedURL string, options upstreamFetchOptions) (Meta, error) {
+	resp, err := s.doUpstreamRequest(ctx, normalizedURL, options.Headers)
 	if err != nil {
 		return Meta{}, err
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusForbidden && len(options.Headers) > 0 && options.Mode != fetchModeAnonymous {
+		log.Printf("upstream 403 url=%s mode=%s", normalizedURL, options.Mode)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return Meta{}, fmt.Errorf("upstream status: %s", resp.Status)
 	}
@@ -338,7 +406,12 @@ func (s *Server) fetchAndStore(ctx context.Context, normalizedURL string) (Meta,
 		return Meta{}, err
 	}
 
-	finalPath := s.blobPath(normalizedURL)
+	cacheKey := s.cacheKey(normalizedURL, options.CacheVariant)
+	if !options.Cacheable {
+		return s.drainUpstreamBody(normalizedURL, cacheKey, contentType, bodyReader)
+	}
+
+	finalPath := s.blobPath(cacheKey)
 	tmpPath := finalPath + ".tmp"
 
 	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
@@ -376,18 +449,53 @@ func (s *Server) fetchAndStore(ctx context.Context, normalizedURL string) (Meta,
 		ContentType: contentType,
 		Length:      written,
 		CreatedAt:   createdAt,
-		ETag:        buildETag(s.cacheKey(normalizedURL), written, createdAt),
+		ETag:        buildETag(cacheKey, written, createdAt),
 	}
-	if err := writeJSONAtomic(s.metaPath(normalizedURL), meta); err != nil {
+	if err := writeJSONAtomic(s.metaPath(cacheKey), meta); err != nil {
 		_ = os.Remove(finalPath)
 		return Meta{}, err
 	}
+	log.Printf("upstream fetch ok url=%s mode=%s cache=public", normalizedURL, options.Mode)
 	return meta, nil
 }
 
-func (s *Server) readMeta(normalizedURL string) (Meta, bool) {
-	metaPath := s.metaPath(normalizedURL)
-	blobPath := s.blobPath(normalizedURL)
+func (s *Server) drainUpstreamBody(normalizedURL, cacheKey, contentType string, bodyReader io.Reader) (Meta, error) {
+	limitedBody := io.LimitReader(bodyReader, s.cfg.MaxBodyBytes+1)
+	written, err := io.Copy(io.Discard, limitedBody)
+	if err != nil {
+		return Meta{}, err
+	}
+	if written > s.cfg.MaxBodyBytes {
+		return Meta{}, fmt.Errorf("image too large: %d bytes", written)
+	}
+	createdAt := time.Now().UTC()
+	meta := Meta{
+		SourceURL:   normalizedURL,
+		ContentType: contentType,
+		Length:      written,
+		CreatedAt:   createdAt,
+		ETag:        buildETag(cacheKey, written, createdAt),
+	}
+	log.Printf("upstream fetch ok url=%s mode=forwarded cache=private", normalizedURL)
+	return meta, nil
+}
+
+func (s *Server) doUpstreamRequest(ctx context.Context, normalizedURL string, headers map[string]string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, normalizedURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "piccache/1.0")
+	req.Header.Set("Accept", "image/*,video/*,*/*;q=0.8")
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+	return s.httpClient.Do(req)
+}
+
+func (s *Server) readMeta(cacheKey string) (Meta, bool) {
+	metaPath := s.metaPath(cacheKey)
+	blobPath := s.blobPath(cacheKey)
 
 	payload, err := os.ReadFile(metaPath)
 	if err != nil {
@@ -411,24 +519,238 @@ func (s *Server) isExpired(meta Meta) bool {
 	return time.Since(meta.CreatedAt) > s.cfg.CacheTTL
 }
 
-func (s *Server) cacheKey(normalizedURL string) string {
-	sum := sha256.Sum256([]byte(normalizedURL))
+func (s *Server) cacheKey(normalizedURL, variant string) string {
+	sum := sha256.Sum256([]byte(normalizedURL + "\n" + variant))
 	return hex.EncodeToString(sum[:])
 }
 
-func (s *Server) shardDir(normalizedURL string) string {
-	key := s.cacheKey(normalizedURL)
-	return filepath.Join(s.cfg.CacheDir, key[:2], key[2:4])
+func (s *Server) shardDir(cacheKey string) string {
+	return filepath.Join(s.cfg.CacheDir, cacheKey[:2], cacheKey[2:4])
 }
 
-func (s *Server) blobPath(normalizedURL string) string {
-	key := s.cacheKey(normalizedURL)
-	return filepath.Join(s.shardDir(normalizedURL), key+".bin")
+func (s *Server) blobPath(cacheKey string) string {
+	return filepath.Join(s.shardDir(cacheKey), cacheKey+".bin")
 }
 
-func (s *Server) metaPath(normalizedURL string) string {
-	key := s.cacheKey(normalizedURL)
-	return filepath.Join(s.shardDir(normalizedURL), key+".json")
+func (s *Server) metaPath(cacheKey string) string {
+	return filepath.Join(s.shardDir(cacheKey), cacheKey+".json")
+}
+
+func (s *Server) defaultFetchOptions() upstreamFetchOptions {
+	return upstreamFetchOptions{
+		Headers:      map[string]string{},
+		CacheVariant: "anonymous",
+		Cacheable:    true,
+		Mode:         fetchModeAnonymous,
+	}
+}
+
+func (s *Server) resolveFetchOptions(normalizedURL string, forwarded upstreamFetchOptions) upstreamFetchOptions {
+	options := s.defaultFetchOptions()
+	if rule, ok := s.matchUpstreamHeaderRule(normalizedURL); ok {
+		options.Headers = cloneHeaders(rule.headerMap())
+		options.CacheVariant = rule.cacheVariant()
+		options.Mode = fetchModeRule
+	}
+	if len(forwarded.Headers) == 0 {
+		return options
+	}
+
+	options.Headers = mergeHeaders(options.Headers, forwarded.Headers)
+	options.Mode = fetchModeForwarded
+	options.Cacheable = forwarded.Cacheable
+	if forwarded.Cacheable {
+		options.CacheVariant = buildCacheVariant(options.Headers)
+		return options
+	}
+
+	options.CacheVariant = "private"
+	return options
+}
+
+func (s *Server) matchUpstreamHeaderRule(normalizedURL string) (UpstreamHeaderRule, bool) {
+	parsed, err := url.Parse(normalizedURL)
+	if err != nil {
+		return UpstreamHeaderRule{}, false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	for _, rule := range s.cfg.UpstreamHeaderRules {
+		for _, pattern := range rule.Hosts {
+			if hostMatchesPattern(host, pattern) {
+				return rule, true
+			}
+		}
+	}
+	return UpstreamHeaderRule{}, false
+}
+
+func (s *Server) buildForwardedOptions(normalizedURL string, raw map[string]string) (upstreamFetchOptions, error) {
+	return s.buildForwardedOptionsFromMap(normalizedURL, raw, true)
+}
+
+func (s *Server) buildForwardedOptionsFromRequest(normalizedURL string, headers http.Header, allowSensitive bool) (upstreamFetchOptions, error) {
+	raw := make(map[string]string)
+	for _, key := range allowedForwardHeaders(allowSensitive) {
+		if value := strings.TrimSpace(headers.Get(key)); value != "" {
+			raw[key] = value
+		}
+	}
+	return s.buildForwardedOptionsFromMap(normalizedURL, raw, allowSensitive)
+}
+
+func (s *Server) buildForwardedOptionsFromMap(normalizedURL string, raw map[string]string, allowSensitive bool) (upstreamFetchOptions, error) {
+	forwarded := make(map[string]string)
+	if len(raw) == 0 {
+		return upstreamFetchOptions{Headers: forwarded, Cacheable: true}, nil
+	}
+
+	parsed, err := url.Parse(normalizedURL)
+	if err != nil {
+		return upstreamFetchOptions{}, err
+	}
+	host := strings.ToLower(parsed.Hostname())
+
+	cacheable := true
+	for key, value := range raw {
+		canonical := http.CanonicalHeaderKey(strings.TrimSpace(key))
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if !isAllowedForwardHeader(canonical) {
+			return upstreamFetchOptions{}, fmt.Errorf("upstream header %q is not allowed", canonical)
+		}
+		if isSensitiveForwardHeader(canonical) {
+			if !allowSensitive {
+				continue
+			}
+			cacheable = false
+			if !hostAllowed(host, s.cfg.CredentialedHosts) {
+				return upstreamFetchOptions{}, fmt.Errorf("credentialed upstream headers are not allowed for host %q", host)
+			}
+		}
+		forwarded[canonical] = trimmed
+	}
+
+	return upstreamFetchOptions{
+		Headers:      forwarded,
+		CacheVariant: buildCacheVariant(forwarded),
+		Cacheable:    cacheable,
+		Mode:         fetchModeForwarded,
+	}, nil
+}
+
+func isAllowedForwardHeader(header string) bool {
+	switch header {
+	case "Referer", "Origin", "Cookie", "Authorization", "User-Agent", "Accept-Language":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSensitiveForwardHeader(header string) bool {
+	return header == "Cookie" || header == "Authorization"
+}
+
+func allowedForwardHeaders(allowSensitive bool) []string {
+	headers := []string{"Referer", "Origin", "User-Agent", "Accept-Language"}
+	if allowSensitive {
+		headers = append(headers, "Cookie", "Authorization")
+	}
+	return headers
+}
+
+func hostAllowed(host string, patterns []string) bool {
+	if len(patterns) == 0 {
+		return false
+	}
+	for _, pattern := range patterns {
+		if hostMatchesPattern(host, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func hostMatchesPattern(host, pattern string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	if host == "" || pattern == "" {
+		return false
+	}
+	if strings.HasPrefix(pattern, "*.") {
+		suffix := strings.TrimPrefix(pattern, "*.")
+		return host == suffix || strings.HasSuffix(host, "."+suffix)
+	}
+	return host == pattern
+}
+
+func (r UpstreamHeaderRule) headerMap() map[string]string {
+	headers := make(map[string]string)
+	if v := strings.TrimSpace(r.Referer); v != "" {
+		headers["Referer"] = v
+	}
+	if v := strings.TrimSpace(r.Origin); v != "" {
+		headers["Origin"] = v
+	}
+	if v := strings.TrimSpace(r.UserAgent); v != "" {
+		headers["User-Agent"] = v
+	}
+	if v := strings.TrimSpace(r.AcceptLanguage); v != "" {
+		headers["Accept-Language"] = v
+	}
+	for key, value := range r.Headers {
+		canonical := http.CanonicalHeaderKey(strings.TrimSpace(key))
+		trimmed := strings.TrimSpace(value)
+		if canonical == "" || trimmed == "" || isSensitiveForwardHeader(canonical) {
+			continue
+		}
+		headers[canonical] = trimmed
+	}
+	return headers
+}
+
+func (r UpstreamHeaderRule) cacheVariant() string {
+	return buildCacheVariant(r.headerMap())
+}
+
+func cloneHeaders(headers map[string]string) map[string]string {
+	cloned := make(map[string]string, len(headers))
+	for key, value := range headers {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func mergeHeaders(base, overlay map[string]string) map[string]string {
+	merged := cloneHeaders(base)
+	for key, value := range overlay {
+		merged[key] = value
+	}
+	return merged
+}
+
+func buildCacheVariant(headers map[string]string) string {
+	if len(headers) == 0 {
+		return "anonymous"
+	}
+	keys := make([]string, 0, len(headers))
+	for key := range headers {
+		if isSensitiveForwardHeader(key) {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return "anonymous"
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, key+"="+headers[key])
+	}
+	return strings.Join(parts, "\n")
 }
 
 // safeDialContext 禁止访问私网、回环等地址，避免 SSRF。
@@ -723,6 +1045,35 @@ func parseInt64OrDefault(key string, defaultValue int64) int64 {
 		return defaultValue
 	}
 	return parsed
+}
+
+func parseCSVEnv(key string) []string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func parseUpstreamHeaderRules(key string) []UpstreamHeaderRule {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return nil
+	}
+	var rules []UpstreamHeaderRule
+	if err := json.Unmarshal([]byte(value), &rules); err != nil {
+		log.Printf("parse %s failed: %v", key, err)
+		return nil
+	}
+	return rules
 }
 
 func loggingMiddleware(next http.Handler) http.Handler {

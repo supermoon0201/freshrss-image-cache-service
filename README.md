@@ -6,7 +6,11 @@
 
 - 提供 `GET /healthz` 健康检查接口
 - 提供 `GET /piccache?url=...` 读取缓存或从上游抓取资源
+- 提供 `HEAD /piccache?url=...` 只返回响应头，可用于探测缓存状态与资源元信息
 - 提供 `POST /piccache` 主动预热缓存，需传入 `url` 和 `access_token`
+- 支持按域名配置上游请求头，例如 `Referer`、`Origin`、`User-Agent`、`Accept-Language`
+- 支持 `POST /piccache` 受控透传白名单请求头到上游，适配需要登录态或动态 `Referer` 的图片源
+- 支持 `GET /piccache` 从当前请求继承非敏感白名单头到上游，适配基于 `Referer` / `Origin` 的防盗链
 - 内置 SSRF 防护，拒绝访问私网、回环、链路本地、多播和未指定地址
 - 采用磁盘分片缓存，并支持 TTL 过期清理和最大容量淘汰
 
@@ -23,6 +27,82 @@
 | `JANITOR_INTERVAL` | `1h` | 清理任务执行间隔 |
 | `MAX_CACHE_BYTES` | `10737418240` | 缓存允许的最大总大小 |
 | `UPSTREAM_CONCURRENCY` | `16` | 同时抓取上游资源的并发上限 |
+| `UPSTREAM_HEADER_RULES_JSON` | 空 | 按域名匹配的上游请求头规则，JSON 数组 |
+| `CREDENTIAL_FORWARD_HOSTS` | 空 | 允许通过 `POST /piccache` 透传 `Cookie`/`Authorization` 的域名白名单，逗号分隔，支持 `*.example.com` |
+
+## 上游请求头规则
+
+`UPSTREAM_HEADER_RULES_JSON` 使用 JSON 数组配置，示例：
+
+```json
+[
+  {
+    "name": "example-cdn",
+    "hosts": ["img.example.com", "*.img.example.com"],
+    "referer": "https://www.example.com/post/123",
+    "origin": "https://www.example.com",
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "accept_language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "headers": {
+      "Cache-Control": "no-cache"
+    }
+  }
+]
+```
+
+说明：
+
+- 域名规则仅适合无敏感凭证的静态请求头，例如 `Referer`、`Origin`、`User-Agent`
+- 规则会参与公共缓存分片；不同请求头组合会生成不同缓存键，避免互相污染
+- 不建议在规则中放入 `Cookie` 或 `Authorization`
+
+## POST 透传上游请求头
+
+`POST /piccache` 现在支持可选的 `upstream_headers` 字段：
+
+```json
+{
+  "url": "https://target.example.com/image.jpg",
+  "access_token": "change-me",
+  "upstream_headers": {
+    "Referer": "https://target.example.com/post/123",
+    "Cookie": "session=abc"
+  }
+}
+```
+
+限制如下：
+
+- 只允许透传 `Referer`、`Origin`、`Cookie`、`Authorization`、`User-Agent`、`Accept-Language`
+- `Cookie` 和 `Authorization` 仅允许发往 `CREDENTIAL_FORWARD_HOSTS` 白名单域名
+- 带 `Cookie` 或 `Authorization` 的抓取结果不会进入公共缓存，避免用户态资源泄漏
+
+## GET 继承请求头
+
+`GET /piccache?url=...` 在缓存未命中时，会从当前请求自动继承以下非敏感请求头到上游：
+
+- `Referer`
+- `Origin`
+- `User-Agent`
+- `Accept-Language`
+
+这意味着如果上游图片源基于 `Referer` 防盗链，调用方只要请求本服务时带上正确的 `Referer`，首次 `GET` 也可以直接抓图并缓存。
+
+## HEAD 探测
+
+`HEAD /piccache?url=...` 与 `GET` 使用同一套缓存和回源逻辑：
+
+- 命中缓存时直接返回响应头
+- 未命中缓存时会回源抓取、写入缓存，再返回响应头
+- 响应不包含 body
+
+适合用于查看：
+
+- `X-Piccache-Status`
+- `Content-Type`
+- `Content-Length`
+- `ETag`
+- `Last-Modified`
 
 ## 本地运行
 
