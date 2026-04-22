@@ -14,7 +14,13 @@ services:
       CACHE_TTL: 720h
       JANITOR_INTERVAL: 1h
       MAX_CACHE_BYTES: 10737418240
-      UPSTREAM_CONCURRENCY: 16
+      UPSTREAM_CONCURRENCY: 64
+      UPSTREAM_CONCURRENCY_PER_HOST: 8
+      META_CACHE_ENTRIES: 4096
+      STALE_GRACE_PERIOD: 10m
+      WARM_META_ON_START: "true"
+      WARM_META_ENTRIES: 2048
+      JANITOR_SHARD_BATCH: 32
     volumes:
       - ./data/cache:/data/cache
     healthcheck:

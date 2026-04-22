@@ -13,6 +13,10 @@
 - 支持 `GET /piccache` 从当前请求继承非敏感白名单头到上游；若未提供 `Referer` / `Origin`，会从目标 URL 自动推导并在 403 时有限回退
 - 内置 SSRF 防护，拒绝访问私网、回环、链路本地、多播和未指定地址
 - 采用磁盘分片缓存，并支持 TTL 过期清理和最大容量淘汰
+- 命中路径使用进程内元数据 LRU，减少高并发读盘
+- 支持过期缓存 `stale-while-revalidate`，优先返回旧内容并后台刷新
+- 支持启动后异步预热元数据和按 shard 渐进式 janitor 清理
+- 支持条件回源校验和单 host 并发限制，降低热点回源压力
 
 ## 环境变量
 
@@ -27,6 +31,12 @@
 | `JANITOR_INTERVAL` | `1h` | 清理任务执行间隔 |
 | `MAX_CACHE_BYTES` | `10737418240` | 缓存允许的最大总大小 |
 | `UPSTREAM_CONCURRENCY` | `64` | 同时抓取上游资源的并发上限 |
+| `UPSTREAM_CONCURRENCY_PER_HOST` | `8` | 单个上游 host 的并发抓取上限 |
+| `META_CACHE_ENTRIES` | `4096` | 进程内元数据 LRU 容量 |
+| `STALE_GRACE_PERIOD` | `10m` | 缓存过期后仍可返回旧内容并后台刷新的宽限时间 |
+| `WARM_META_ON_START` | `true` | 启动后是否异步预热磁盘元数据到内存 |
+| `WARM_META_ENTRIES` | `2048` | 启动预热最多加载的元数据条目数 |
+| `JANITOR_SHARD_BATCH` | `32` | 每轮 janitor 扫描的 shard 目录数量 |
 | `UPSTREAM_HEADER_RULES_JSON` | 空 | 按域名匹配的上游请求头规则，JSON 数组 |
 | `CREDENTIAL_FORWARD_HOSTS` | 空 | 允许通过 `POST /piccache` 透传 `Cookie`/`Authorization` 的域名白名单，逗号分隔，支持 `*.example.com` |
 

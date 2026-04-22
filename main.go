@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -38,6 +39,12 @@ type Config struct {
 	JanitorInterval     time.Duration
 	MaxCacheBytes       int64
 	UpstreamConcurrency int
+	PerHostConcurrency  int
+	MetaCacheEntries    int
+	StaleGracePeriod    time.Duration
+	WarmMetaOnStart     bool
+	WarmMetaEntries     int
+	JanitorShardBatch   int
 	AllowedSchemes      map[string]struct{}
 	UpstreamHeaderRules []UpstreamHeaderRule
 	CredentialedHosts   []string
@@ -55,11 +62,13 @@ type UpstreamHeaderRule struct {
 
 // Meta 存放缓存元数据。
 type Meta struct {
-	SourceURL   string    `json:"source_url"`
-	ContentType string    `json:"content_type"`
-	Length      int64     `json:"length"`
-	CreatedAt   time.Time `json:"created_at"`
-	ETag        string    `json:"etag"`
+	SourceURL            string    `json:"source_url"`
+	ContentType          string    `json:"content_type"`
+	Length               int64     `json:"length"`
+	CreatedAt            time.Time `json:"created_at"`
+	ETag                 string    `json:"etag"`
+	UpstreamETag         string    `json:"upstream_etag,omitempty"`
+	UpstreamLastModified string    `json:"upstream_last_modified,omitempty"`
 }
 
 // Server 是图片缓存服务。
@@ -67,10 +76,22 @@ type Server struct {
 	cfg              Config
 	httpClient       *http.Client
 	group            singleflight.Group
+	refreshGroup     singleflight.Group
 	fetchSem         chan struct{}
 	metaCacheMu      sync.RWMutex
-	metaCache        map[string]Meta
+	metaCache        map[string]*list.Element
+	metaCacheList    *list.List
+	hostFetchMu      sync.Mutex
+	hostFetchSem     map[string]chan struct{}
+	janitorMu        sync.Mutex
+	janitorCursor    int
+	copyBufferPool   sync.Pool
 	metaDiskReadHook func(string)
+}
+
+type metaCacheEntry struct {
+	Key  string
+	Meta Meta
 }
 
 type cacheResult struct {
@@ -124,6 +145,9 @@ func main() {
 		log.Fatalf("init server failed: %v", err)
 	}
 
+	if cfg.WarmMetaOnStart {
+		go server.warmMetaCache(context.Background(), cfg.WarmMetaEntries)
+	}
 	go server.runJanitor(context.Background())
 
 	mux := http.NewServeMux()
@@ -148,6 +172,10 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 
 	upstreamConcurrency := normalizeUpstreamConcurrency(cfg.UpstreamConcurrency)
+	cfg.UpstreamConcurrency = upstreamConcurrency
+	cfg.PerHostConcurrency = normalizePositive(cfg.PerHostConcurrency, minInt(8, upstreamConcurrency))
+	cfg.MetaCacheEntries = normalizePositive(cfg.MetaCacheEntries, 4096)
+	cfg.JanitorShardBatch = normalizePositive(cfg.JanitorShardBatch, 32)
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           safeDialContext,
@@ -165,8 +193,16 @@ func NewServer(cfg Config) (*Server, error) {
 			Transport: transport,
 			Timeout:   cfg.FetchTimeout,
 		},
-		fetchSem:  make(chan struct{}, upstreamConcurrency),
-		metaCache: make(map[string]Meta),
+		fetchSem:      make(chan struct{}, upstreamConcurrency),
+		metaCache:     make(map[string]*list.Element),
+		metaCacheList: list.New(),
+		hostFetchSem:  make(map[string]chan struct{}),
+		copyBufferPool: sync.Pool{
+			New: func() any {
+				buf := make([]byte, 32<<10)
+				return &buf
+			},
+		},
 	}, nil
 }
 
@@ -254,7 +290,9 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, headOnly boo
 		return
 	}
 
-	http.ServeFile(w, r, s.blobPath(cacheKey))
+	if err := s.serveCachedBlob(w, r, cacheKey, result.Meta); err != nil {
+		http.Error(w, "cache file missing", http.StatusNotFound)
+	}
 }
 
 func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
@@ -313,7 +351,7 @@ func (s *Server) normalizeURL(raw string) (string, error) {
 func (s *Server) ensureCached(ctx context.Context, normalizedURL string, forwarded upstreamFetchOptions) (cacheResult, error) {
 	effective := s.resolveFetchOptions(normalizedURL, forwarded)
 	if !effective.Cacheable {
-		meta, err := s.fetchAndStore(ctx, normalizedURL, effective)
+		meta, _, err := s.fetchAndStore(ctx, normalizedURL, effective, nil)
 		if err != nil {
 			return cacheResult{}, err
 		}
@@ -322,104 +360,130 @@ func (s *Server) ensureCached(ctx context.Context, normalizedURL string, forward
 
 	cacheKey := s.cacheKey(normalizedURL, effective.CacheVariant)
 
-	// 命中且未过期，直接返回。
-	if meta, ok := s.readMeta(cacheKey); ok && !s.isExpired(meta) {
-		return cacheResult{Meta: meta, Status: "HIT"}, nil
+	if meta, ok := s.readMeta(cacheKey); ok {
+		if !s.isExpired(meta) {
+			return cacheResult{Meta: meta, Status: "HIT"}, nil
+		}
+		if s.canServeStale(cacheKey, meta) {
+			s.refreshStaleCache(normalizedURL, effective, cacheKey, meta)
+			return cacheResult{Meta: meta, Status: "STALE"}, nil
+		}
 	}
 
-	// 限制并发抓取数，避免上游被你自己打爆。
-	select {
-	case s.fetchSem <- struct{}{}:
-		defer func() { <-s.fetchSem }()
-	case <-ctx.Done():
-		return cacheResult{}, ctx.Err()
-	}
-
-	// 双检，避免并发下重复下载。
-	if meta, ok := s.readMeta(cacheKey); ok && !s.isExpired(meta) {
-		return cacheResult{Meta: meta, Status: "HIT"}, nil
-	}
-
-	meta, err := s.fetchAndStore(ctx, normalizedURL, effective)
+	release, err := s.acquireFetchSlots(ctx, normalizedURL)
 	if err != nil {
 		return cacheResult{}, err
+	}
+	defer release()
+
+	var existing *Meta
+	if meta, ok := s.readMeta(cacheKey); ok {
+		if !s.isExpired(meta) {
+			return cacheResult{Meta: meta, Status: "HIT"}, nil
+		}
+		if s.canServeStale(cacheKey, meta) {
+			s.refreshStaleCache(normalizedURL, effective, cacheKey, meta)
+			return cacheResult{Meta: meta, Status: "STALE"}, nil
+		}
+		existing = &meta
+	}
+
+	meta, revalidated, err := s.fetchAndStore(ctx, normalizedURL, effective, existing)
+	if err != nil {
+		return cacheResult{}, err
+	}
+	if revalidated {
+		return cacheResult{Meta: meta, Status: "REVALIDATED"}, nil
 	}
 	return cacheResult{Meta: meta, Status: "MISS"}, nil
 }
 
-func (s *Server) fetchAndStore(ctx context.Context, normalizedURL string, options upstreamFetchOptions) (Meta, error) {
+func (s *Server) fetchAndStore(ctx context.Context, normalizedURL string, options upstreamFetchOptions, existing *Meta) (Meta, bool, error) {
 	attemptHeaders := append([]map[string]string{cloneHeaders(options.Headers)}, cloneHeaderList(options.RetryHeaders)...)
+	for idx := range attemptHeaders {
+		attemptHeaders[idx] = mergeHeaders(attemptHeaders[idx], s.conditionalHeaders(existing))
+	}
 	resp, usedHeaders, err := s.doUpstreamRequestWithRetries(ctx, normalizedURL, attemptHeaders, options.Mode)
 	if err != nil {
-		return Meta{}, err
+		return Meta{}, false, err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return Meta{}, fmt.Errorf("upstream status: %s", resp.Status)
-	}
-
-	contentType, bodyReader, err := validateUpstreamBody(resp)
-	if err != nil {
-		return Meta{}, err
-	}
 
 	cacheVariant := options.CacheVariant
 	if cacheVariant == "" {
 		cacheVariant = buildCacheVariant(usedHeaders)
 	}
 	cacheKey := s.cacheKey(normalizedURL, cacheVariant)
+
+	if resp.StatusCode == http.StatusNotModified && existing != nil && options.Cacheable {
+		meta, err := s.revalidateMeta(cacheKey, *existing, resp.Header)
+		return meta, true, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return Meta{}, false, fmt.Errorf("upstream status: %s", resp.Status)
+	}
+
+	contentType, bodyReader, err := validateUpstreamBody(resp)
+	if err != nil {
+		return Meta{}, false, err
+	}
+
 	if !options.Cacheable {
-		return s.drainUpstreamBody(normalizedURL, cacheKey, contentType, bodyReader)
+		meta, err := s.drainUpstreamBody(normalizedURL, cacheKey, contentType, bodyReader)
+		return meta, false, err
 	}
 
 	finalPath := s.blobPath(cacheKey)
 	tmpPath := finalPath + ".tmp"
 
 	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
-		return Meta{}, err
+		return Meta{}, false, err
 	}
 
 	out, err := os.Create(tmpPath)
 	if err != nil {
-		return Meta{}, err
+		return Meta{}, false, err
 	}
 
 	limitedBody := io.LimitReader(bodyReader, s.cfg.MaxBodyBytes+1)
-	written, copyErr := io.Copy(out, limitedBody)
+	bufPtr := s.copyBufferPool.Get().(*[]byte)
+	written, copyErr := io.CopyBuffer(out, limitedBody, *bufPtr)
+	s.copyBufferPool.Put(bufPtr)
 	closeErr := out.Close()
 	if copyErr != nil || closeErr != nil {
 		_ = os.Remove(tmpPath)
 		if copyErr != nil {
-			return Meta{}, copyErr
+			return Meta{}, false, copyErr
 		}
-		return Meta{}, closeErr
+		return Meta{}, false, closeErr
 	}
 	if written > s.cfg.MaxBodyBytes {
 		_ = os.Remove(tmpPath)
-		return Meta{}, fmt.Errorf("image too large: %d bytes", written)
+		return Meta{}, false, fmt.Errorf("image too large: %d bytes", written)
 	}
 
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		_ = os.Remove(tmpPath)
-		return Meta{}, err
+		return Meta{}, false, err
 	}
 
 	createdAt := time.Now().UTC()
 	meta := Meta{
-		SourceURL:   normalizedURL,
-		ContentType: contentType,
-		Length:      written,
-		CreatedAt:   createdAt,
-		ETag:        buildETag(cacheKey, written, createdAt),
+		SourceURL:            normalizedURL,
+		ContentType:          contentType,
+		Length:               written,
+		CreatedAt:            createdAt,
+		ETag:                 buildETag(cacheKey, written, createdAt),
+		UpstreamETag:         strings.TrimSpace(resp.Header.Get("ETag")),
+		UpstreamLastModified: strings.TrimSpace(resp.Header.Get("Last-Modified")),
 	}
 	if err := writeJSONAtomic(s.metaPath(cacheKey), meta); err != nil {
 		_ = os.Remove(finalPath)
-		return Meta{}, err
+		return Meta{}, false, err
 	}
 	s.writeMetaToMemory(cacheKey, meta)
 	log.Printf("upstream fetch ok url=%s mode=%s cache=public", normalizedURL, options.Mode)
-	return meta, nil
+	return meta, false, nil
 }
 
 func (s *Server) drainUpstreamBody(normalizedURL, cacheKey, contentType string, bodyReader io.Reader) (Meta, error) {
@@ -509,21 +573,174 @@ func (s *Server) readMeta(cacheKey string) (Meta, bool) {
 
 func (s *Server) readMetaFromMemory(cacheKey string) (Meta, bool) {
 	s.metaCacheMu.RLock()
-	meta, ok := s.metaCache[cacheKey]
+	_, ok := s.metaCache[cacheKey]
 	s.metaCacheMu.RUnlock()
-	return meta, ok
+	if !ok {
+		return Meta{}, false
+	}
+
+	s.metaCacheMu.Lock()
+	if current, ok := s.metaCache[cacheKey]; ok {
+		s.metaCacheList.MoveToFront(current)
+		meta := current.Value.(*metaCacheEntry).Meta
+		s.metaCacheMu.Unlock()
+		return meta, true
+	}
+	s.metaCacheMu.Unlock()
+	return Meta{}, false
 }
 
 func (s *Server) writeMetaToMemory(cacheKey string, meta Meta) {
 	s.metaCacheMu.Lock()
-	s.metaCache[cacheKey] = meta
+	if element, ok := s.metaCache[cacheKey]; ok {
+		element.Value.(*metaCacheEntry).Meta = meta
+		s.metaCacheList.MoveToFront(element)
+		s.metaCacheMu.Unlock()
+		return
+	}
+	entry := &metaCacheEntry{Key: cacheKey, Meta: meta}
+	element := s.metaCacheList.PushFront(entry)
+	s.metaCache[cacheKey] = element
+	for s.cfg.MetaCacheEntries > 0 && s.metaCacheList.Len() > s.cfg.MetaCacheEntries {
+		tail := s.metaCacheList.Back()
+		if tail == nil {
+			break
+		}
+		s.metaCacheList.Remove(tail)
+		delete(s.metaCache, tail.Value.(*metaCacheEntry).Key)
+	}
 	s.metaCacheMu.Unlock()
 }
 
 func (s *Server) deleteMetaCache(cacheKey string) {
 	s.metaCacheMu.Lock()
-	delete(s.metaCache, cacheKey)
+	if element, ok := s.metaCache[cacheKey]; ok {
+		s.metaCacheList.Remove(element)
+		delete(s.metaCache, cacheKey)
+	}
 	s.metaCacheMu.Unlock()
+}
+
+func (s *Server) conditionalHeaders(existing *Meta) map[string]string {
+	if existing == nil {
+		return nil
+	}
+	headers := map[string]string{}
+	if tag := strings.TrimSpace(existing.UpstreamETag); tag != "" {
+		headers["If-None-Match"] = tag
+	}
+	if modified := strings.TrimSpace(existing.UpstreamLastModified); modified != "" {
+		headers["If-Modified-Since"] = modified
+	}
+	return headers
+}
+
+func (s *Server) revalidateMeta(cacheKey string, existing Meta, headers http.Header) (Meta, error) {
+	refreshedAt := time.Now().UTC()
+	existing.CreatedAt = refreshedAt
+	existing.ETag = buildETag(cacheKey, existing.Length, refreshedAt)
+	if tag := strings.TrimSpace(headers.Get("ETag")); tag != "" {
+		existing.UpstreamETag = tag
+	}
+	if modified := strings.TrimSpace(headers.Get("Last-Modified")); modified != "" {
+		existing.UpstreamLastModified = modified
+	}
+	if err := writeJSONAtomic(s.metaPath(cacheKey), existing); err != nil {
+		return Meta{}, err
+	}
+	s.writeMetaToMemory(cacheKey, existing)
+	return existing, nil
+}
+
+func (s *Server) canServeStale(cacheKey string, meta Meta) bool {
+	if s.cfg.StaleGracePeriod <= 0 {
+		return false
+	}
+	if !s.isExpired(meta) {
+		return false
+	}
+	if time.Since(meta.CreatedAt) > s.cfg.CacheTTL+s.cfg.StaleGracePeriod {
+		return false
+	}
+	_, err := os.Stat(s.blobPath(cacheKey))
+	return err == nil
+}
+
+func (s *Server) serveCachedBlob(w http.ResponseWriter, _ *http.Request, cacheKey string, meta Meta) error {
+	file, err := os.Open(s.blobPath(cacheKey))
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	w.Header().Set("Content-Length", strconv.FormatInt(meta.Length, 10))
+	w.WriteHeader(http.StatusOK)
+	_, err = io.Copy(w, file)
+	return err
+}
+
+func (s *Server) refreshStaleCache(normalizedURL string, options upstreamFetchOptions, cacheKey string, existing Meta) {
+	go func() {
+		_, _, _ = s.refreshGroup.Do(cacheKey, func() (any, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), s.cfg.FetchTimeout)
+			defer cancel()
+			release, err := s.acquireFetchSlots(ctx, normalizedURL)
+			if err != nil {
+				return nil, err
+			}
+			defer release()
+			_, _, err = s.fetchAndStore(ctx, normalizedURL, options, &existing)
+			return nil, err
+		})
+	}()
+}
+
+func (s *Server) acquireFetchSlots(ctx context.Context, normalizedURL string) (func(), error) {
+	select {
+	case s.fetchSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	released := false
+	releaseGlobal := func() {
+		if released {
+			return
+		}
+		released = true
+		<-s.fetchSem
+	}
+
+	host := normalizedURL
+	if parsed, err := url.Parse(normalizedURL); err == nil && parsed.Hostname() != "" {
+		host = strings.ToLower(parsed.Hostname())
+	}
+	if s.cfg.PerHostConcurrency <= 0 {
+		return releaseGlobal, nil
+	}
+
+	hostSem := s.hostSemaphore(host)
+	select {
+	case hostSem <- struct{}{}:
+		return func() {
+			<-hostSem
+			releaseGlobal()
+		}, nil
+	case <-ctx.Done():
+		releaseGlobal()
+		return nil, ctx.Err()
+	}
+}
+
+func (s *Server) hostSemaphore(host string) chan struct{} {
+	s.hostFetchMu.Lock()
+	defer s.hostFetchMu.Unlock()
+	sem, ok := s.hostFetchSem[host]
+	if ok {
+		return sem
+	}
+	sem = make(chan struct{}, s.cfg.PerHostConcurrency)
+	s.hostFetchSem[host] = sem
+	return sem
 }
 
 func (s *Server) isExpired(meta Meta) bool {
@@ -1014,8 +1231,7 @@ func writeJSONAtomic(path string, value any) error {
 }
 
 func (s *Server) runJanitor(ctx context.Context) {
-	s.cleanupExpiredFiles()
-	s.cleanupOversizeCache()
+	s.runJanitorSweep()
 
 	if s.cfg.JanitorInterval <= 0 {
 		return
@@ -1027,48 +1243,60 @@ func (s *Server) runJanitor(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
-			s.cleanupExpiredFiles()
-			s.cleanupOversizeCache()
+			s.runJanitorSweep()
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (s *Server) cleanupExpiredFiles() {
+func (s *Server) runJanitorSweep() {
+	shards, wrapped := s.nextJanitorShardBatch()
+	s.cleanupExpiredFiles(shards)
+	if wrapped {
+		s.cleanupOversizeCache()
+	}
+}
+
+func (s *Server) cleanupExpiredFiles(shardDirs []string) {
 	removed := 0
+	if len(shardDirs) == 0 {
+		return
+	}
 
-	_ = filepath.WalkDir(s.cfg.CacheDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
-			return nil
-		}
+	for _, shardDir := range shardDirs {
+		_ = filepath.WalkDir(shardDir, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+				return nil
+			}
 
-		payload, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return nil
-		}
+			payload, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return nil
+			}
 
-		var meta Meta
-		if err := json.Unmarshal(payload, &meta); err != nil {
+			var meta Meta
+			if err := json.Unmarshal(payload, &meta); err != nil {
+				s.deleteMetaCache(cacheKeyFromMetaPath(path))
+				_ = os.Remove(path)
+				_ = os.Remove(strings.TrimSuffix(path, ".json") + ".bin")
+				removed++
+				return nil
+			}
+			if !s.isExpired(meta) {
+				return nil
+			}
+
 			s.deleteMetaCache(cacheKeyFromMetaPath(path))
-			_ = os.Remove(path)
 			_ = os.Remove(strings.TrimSuffix(path, ".json") + ".bin")
+			_ = os.Remove(path)
 			removed++
 			return nil
-		}
-		if !s.isExpired(meta) {
-			return nil
-		}
-
-		s.deleteMetaCache(cacheKeyFromMetaPath(path))
-		_ = os.Remove(strings.TrimSuffix(path, ".json") + ".bin")
-		_ = os.Remove(path)
-		removed++
-		return nil
-	})
+		})
+	}
 
 	if removed > 0 {
 		log.Printf("cleanup removed %d expired cache entries", removed)
@@ -1173,6 +1401,12 @@ func defaultConfig() Config {
 		JanitorInterval:     parseDurationOrDefault("JANITOR_INTERVAL", time.Hour),
 		MaxCacheBytes:       parseInt64OrDefault("MAX_CACHE_BYTES", 10<<30), // 10GB
 		UpstreamConcurrency: int(parseInt64OrDefault("UPSTREAM_CONCURRENCY", 64)),
+		PerHostConcurrency:  int(parseInt64OrDefault("UPSTREAM_CONCURRENCY_PER_HOST", 8)),
+		MetaCacheEntries:    int(parseInt64OrDefault("META_CACHE_ENTRIES", 4096)),
+		StaleGracePeriod:    parseDurationOrDefault("STALE_GRACE_PERIOD", 10*time.Minute),
+		WarmMetaOnStart:     parseBoolOrDefault("WARM_META_ON_START", true),
+		WarmMetaEntries:     int(parseInt64OrDefault("WARM_META_ENTRIES", 2048)),
+		JanitorShardBatch:   int(parseInt64OrDefault("JANITOR_SHARD_BATCH", 32)),
 		AllowedSchemes:      map[string]struct{}{"http": {}, "https": {}},
 		UpstreamHeaderRules: parseUpstreamHeaderRules("UPSTREAM_HEADER_RULES_JSON"),
 		CredentialedHosts:   parseCSVEnv("CREDENTIAL_FORWARD_HOSTS"),
@@ -1186,12 +1420,123 @@ func normalizeUpstreamConcurrency(value int) int {
 	return value
 }
 
+func normalizePositive(value, fallback int) int {
+	if value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func (s *Server) warmMetaCache(ctx context.Context, limit int) {
+	remaining := limit
+	if remaining == 0 {
+		return
+	}
+	for _, shardDir := range s.listShardDirs() {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		_ = filepath.WalkDir(shardDir, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+				return nil
+			}
+			if remaining > 0 && s.metaCacheList.Len() >= remaining {
+				return io.EOF
+			}
+			cacheKey := cacheKeyFromMetaPath(path)
+			if _, ok := s.readMetaFromMemory(cacheKey); ok {
+				return nil
+			}
+			payload, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return nil
+			}
+			var meta Meta
+			if err := json.Unmarshal(payload, &meta); err != nil {
+				return nil
+			}
+			if _, err := os.Stat(strings.TrimSuffix(path, ".json") + ".bin"); err != nil {
+				return nil
+			}
+			s.writeMetaToMemory(cacheKey, meta)
+			return nil
+		})
+		if remaining > 0 && s.metaCacheLen() >= remaining {
+			return
+		}
+	}
+}
+
+func (s *Server) metaCacheLen() int {
+	s.metaCacheMu.RLock()
+	defer s.metaCacheMu.RUnlock()
+	return s.metaCacheList.Len()
+}
+
+func (s *Server) nextJanitorShardBatch() ([]string, bool) {
+	shards := s.listShardDirs()
+	if len(shards) == 0 {
+		return nil, false
+	}
+	batchSize := normalizePositive(s.cfg.JanitorShardBatch, 32)
+
+	s.janitorMu.Lock()
+	defer s.janitorMu.Unlock()
+	if s.janitorCursor >= len(shards) {
+		s.janitorCursor = 0
+	}
+	start := s.janitorCursor
+	end := minInt(start+batchSize, len(shards))
+	batch := append([]string(nil), shards[start:end]...)
+	s.janitorCursor = end
+	wrapped := false
+	if s.janitorCursor >= len(shards) {
+		s.janitorCursor = 0
+		wrapped = true
+	}
+	return batch, wrapped
+}
+
+func (s *Server) listShardDirs() []string {
+	levelOne, err := os.ReadDir(s.cfg.CacheDir)
+	if err != nil {
+		return nil
+	}
+	shards := make([]string, 0)
+	for _, first := range levelOne {
+		if !first.IsDir() {
+			continue
+		}
+		firstPath := filepath.Join(s.cfg.CacheDir, first.Name())
+		levelTwo, err := os.ReadDir(firstPath)
+		if err != nil {
+			continue
+		}
+		for _, second := range levelTwo {
+			if second.IsDir() {
+				shards = append(shards, filepath.Join(firstPath, second.Name()))
+			}
+		}
+	}
+	sort.Strings(shards)
+	return shards
+}
+
 func cacheKeyFromMetaPath(path string) string {
 	return strings.TrimSuffix(filepath.Base(path), ".json")
 }
 
 func maxInt(a, b int) int {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
 		return a
 	}
 	return b
@@ -1215,6 +1560,18 @@ func parseInt64OrDefault(key string, defaultValue int64) int64 {
 		return defaultValue
 	}
 	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return defaultValue
+	}
+	return parsed
+}
+
+func parseBoolOrDefault(key string, defaultValue bool) bool {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.ParseBool(value)
 	if err != nil {
 		return defaultValue
 	}
