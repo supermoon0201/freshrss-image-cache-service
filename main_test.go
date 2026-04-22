@@ -15,6 +15,7 @@ import (
 	"time"
 )
 
+// TestNormalizeURLRemovesFragment 验证 fragment 不参与缓存键和实际回源请求。
 func TestNormalizeURLRemovesFragment(t *testing.T) {
 	server := &Server{
 		cfg: Config{
@@ -36,6 +37,7 @@ func TestNormalizeURLRemovesFragment(t *testing.T) {
 	}
 }
 
+// TestNormalizeURLRejectsUnsupportedScheme 验证只允许配置里的协议。
 func TestNormalizeURLRejectsUnsupportedScheme(t *testing.T) {
 	server := &Server{
 		cfg: Config{
@@ -51,6 +53,8 @@ func TestNormalizeURLRejectsUnsupportedScheme(t *testing.T) {
 	}
 }
 
+// TestDecideContentTypeFallsBackToSniffing 验证没有合法 Content-Type 头时，
+// 仍然能靠内容探测识别图片类型。
 func TestDecideContentTypeFallsBackToSniffing(t *testing.T) {
 	pngPreview := []byte{
 		0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n',
@@ -63,6 +67,7 @@ func TestDecideContentTypeFallsBackToSniffing(t *testing.T) {
 	}
 }
 
+// TestValidateUpstreamBodyRejectsChallengePage 验证挑战页不会被误当成图片缓存。
 func TestValidateUpstreamBodyRejectsChallengePage(t *testing.T) {
 	resp := &http.Response{
 		Header: http.Header{
@@ -79,6 +84,7 @@ func TestValidateUpstreamBodyRejectsChallengePage(t *testing.T) {
 	}
 }
 
+// TestMatchUpstreamHeaderRuleWildcard 验证域名规则里的通配符可以正常命中。
 func TestMatchUpstreamHeaderRuleWildcard(t *testing.T) {
 	server := &Server{
 		cfg: Config{
@@ -102,6 +108,7 @@ func TestMatchUpstreamHeaderRuleWildcard(t *testing.T) {
 	}
 }
 
+// TestBuildForwardedOptionsRejectsDisallowedHeader 验证非白名单头不能透传到上游。
 func TestBuildForwardedOptionsRejectsDisallowedHeader(t *testing.T) {
 	server := &Server{}
 	_, err := server.buildForwardedOptions("https://example.com/a.png", map[string]string{
@@ -112,6 +119,7 @@ func TestBuildForwardedOptionsRejectsDisallowedHeader(t *testing.T) {
 	}
 }
 
+// TestBuildForwardedOptionsRejectsSensitiveHost 验证敏感头只能发往白名单 host。
 func TestBuildForwardedOptionsRejectsSensitiveHost(t *testing.T) {
 	server := &Server{
 		cfg: Config{
@@ -127,6 +135,8 @@ func TestBuildForwardedOptionsRejectsSensitiveHost(t *testing.T) {
 	}
 }
 
+// TestEnsureCachedUsesRuleHeadersAndCachesResult 验证静态规则补头能够真正参与回源，
+// 且首次 miss 后第二次能直接命中缓存。
 func TestEnsureCachedUsesRuleHeadersAndCachesResult(t *testing.T) {
 	var requests atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -175,6 +185,8 @@ func TestEnsureCachedUsesRuleHeadersAndCachesResult(t *testing.T) {
 	}
 }
 
+// TestHandleGetForwardsSafeHeadersAndCachesResult 验证 GET 请求会继承允许的安全头，
+// 并在首次抓取后写入缓存供第二次命中。
 func TestHandleGetForwardsSafeHeadersAndCachesResult(t *testing.T) {
 	var requests atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -224,6 +236,8 @@ func TestHandleGetForwardsSafeHeadersAndCachesResult(t *testing.T) {
 	}
 }
 
+// TestHandleHeadFetchesAndCachesWithoutBody 验证 HEAD 和 GET 走同一套缓存逻辑，
+// 只是最终不返回 body。
 func TestHandleHeadFetchesAndCachesWithoutBody(t *testing.T) {
 	var requests atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -275,6 +289,7 @@ func TestHandleHeadFetchesAndCachesWithoutBody(t *testing.T) {
 	}
 }
 
+// TestInferUpstreamHeadersFromURL 验证自动推导的 Referer / Origin 是否符合预期。
 func TestInferUpstreamHeadersFromURL(t *testing.T) {
 	headers := inferUpstreamHeaders("https://img.hellogithub.com/i/z5ncAjLHSpGDTr1_1771822196.png")
 	if got := headers["Referer"]; got != "https://hellogithub.com/" {
@@ -285,6 +300,8 @@ func TestInferUpstreamHeadersFromURL(t *testing.T) {
 	}
 }
 
+// TestHandleGetInfersHeadersFromTargetURL 验证调用方不显式传 Referer / Origin 时，
+// 服务仍可根据目标 URL 自动推导并抓取成功。
 func TestHandleGetInfersHeadersFromTargetURL(t *testing.T) {
 	var requests atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -324,6 +341,8 @@ func TestHandleGetInfersHeadersFromTargetURL(t *testing.T) {
 	}
 }
 
+// TestFetchAndStoreFallsBackToHostRootHeadersOn403 验证自动推导头第一次失败后，
+// 服务会按预期回退到目标 host 根路径再尝试一次。
 func TestFetchAndStoreFallsBackToHostRootHeadersOn403(t *testing.T) {
 	var requests atomic.Int32
 	targetURL := "https://cdn.assets.example.co.uk/img/demo.png"
@@ -367,6 +386,8 @@ func TestFetchAndStoreFallsBackToHostRootHeadersOn403(t *testing.T) {
 	}
 }
 
+// TestEnsureCachedWithSensitiveForwardedHeadersBypassesSharedCache 验证带 Cookie 的抓取
+// 不会污染共享磁盘缓存，因此连续两次请求都会真正回源。
 func TestEnsureCachedWithSensitiveForwardedHeadersBypassesSharedCache(t *testing.T) {
 	var requests atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -408,6 +429,7 @@ func TestEnsureCachedWithSensitiveForwardedHeadersBypassesSharedCache(t *testing
 	}
 }
 
+// TestDefaultConfigUsesHigherUpstreamConcurrency 锁定新的默认全局并发值。
 func TestDefaultConfigUsesHigherUpstreamConcurrency(t *testing.T) {
 	t.Setenv("UPSTREAM_CONCURRENCY", "")
 
@@ -417,6 +439,8 @@ func TestDefaultConfigUsesHigherUpstreamConcurrency(t *testing.T) {
 	}
 }
 
+// TestNewServerTunesTransportForHighConcurrency 验证 NewServer 会按默认并发调大连接池，
+// 防止后续有人把 transport 又改回保守配置。
 func TestNewServerTunesTransportForHighConcurrency(t *testing.T) {
 	t.Setenv("UPSTREAM_CONCURRENCY", "")
 
@@ -446,6 +470,8 @@ func TestNewServerTunesTransportForHighConcurrency(t *testing.T) {
 	}
 }
 
+// TestConcurrentCacheHitsUseMemoryMetaCache 验证热点命中优先走内存元数据，
+// 而不是每次都去读磁盘上的 .json。
 func TestConcurrentCacheHitsUseMemoryMetaCache(t *testing.T) {
 	var requests atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -505,6 +531,8 @@ func TestConcurrentCacheHitsUseMemoryMetaCache(t *testing.T) {
 	}
 }
 
+// TestHandleGetServesCachedBlobWithoutServeFile 验证热路径改成“自己打开缓存文件并流式返回”后，
+// 仍然能正确输出 body 和 Content-Length。
 func TestHandleGetServesCachedBlobWithoutServeFile(t *testing.T) {
 	server := newTestServer(t)
 	targetURL := "https://example.com/static.png"
@@ -543,8 +571,11 @@ func TestHandleGetServesCachedBlobWithoutServeFile(t *testing.T) {
 	}
 }
 
+// TestEnsureCachedServesStaleAndRefreshesInBackground 验证 stale-while-revalidate：
+// 请求先拿到旧内容，后台再异步刷新元数据和文件。
 func TestEnsureCachedServesStaleAndRefreshesInBackground(t *testing.T) {
 	var requests atomic.Int32
+	// 用一个 channel 观察后台刷新是否真的发生。
 	refreshed := make(chan struct{}, 1)
 	upstreamBody := atomic.Value{}
 	upstreamBody.Store(minimalPNG())
@@ -580,6 +611,7 @@ func TestEnsureCachedServesStaleAndRefreshesInBackground(t *testing.T) {
 		t.Fatalf("writeJSONAtomic returned error: %v", err)
 	}
 	server.writeMetaToMemory(cacheKey, meta)
+	// 改一下上游 body，让后台刷新确实有新内容可写。
 	refreshedBody := append(append([]byte{}, minimalPNG()...), 0x00)
 	upstreamBody.Store(refreshedBody)
 
@@ -597,6 +629,7 @@ func TestEnsureCachedServesStaleAndRefreshesInBackground(t *testing.T) {
 		t.Fatal("background refresh did not complete")
 	}
 
+	// 后台刷新是异步的，这里用短轮询等待元数据时间戳更新。
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		updated, ok := server.readMeta(cacheKey)
@@ -613,6 +646,8 @@ func TestEnsureCachedServesStaleAndRefreshesInBackground(t *testing.T) {
 	}
 }
 
+// TestEnsureCachedUsesConditionalRevalidation 验证本地已有旧缓存时，
+// 会带上条件请求头去拿 304，而不是整文件重下。
 func TestEnsureCachedUsesConditionalRevalidation(t *testing.T) {
 	var requests atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -661,9 +696,12 @@ func TestEnsureCachedUsesConditionalRevalidation(t *testing.T) {
 	}
 }
 
+// TestPerHostConcurrencyLimitApplies 验证“全局并发之外，再加单 host 并发上限”
+// 这条保护是否真的生效。
 func TestPerHostConcurrencyLimitApplies(t *testing.T) {
 	var active atomic.Int32
 	var maxSeen atomic.Int32
+	// release 用来故意把上游请求卡住，方便统计同时在跑多少个请求。
 	release := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		current := active.Add(1)
@@ -711,6 +749,7 @@ func TestPerHostConcurrencyLimitApplies(t *testing.T) {
 	}
 }
 
+// TestMetaCacheLRUEvictsOldEntries 验证元数据缓存达到上限后会淘汰最旧条目。
 func TestMetaCacheLRUEvictsOldEntries(t *testing.T) {
 	server := newTestServer(t)
 	server.cfg.MetaCacheEntries = 1
@@ -725,6 +764,7 @@ func TestMetaCacheLRUEvictsOldEntries(t *testing.T) {
 	}
 }
 
+// TestWarmMetaCacheLoadsDiskEntries 验证启动预热逻辑能把磁盘上的元数据读回内存 LRU。
 func TestWarmMetaCacheLoadsDiskEntries(t *testing.T) {
 	server := newTestServer(t)
 	urlA := "https://example.com/a.png"
@@ -756,9 +796,12 @@ func TestWarmMetaCacheLoadsDiskEntries(t *testing.T) {
 	}
 }
 
+// TestCleanupExpiredFilesProcessesOnlySelectedShards 验证 janitor 的过期清理
+// 是按选中的 shard 分批处理，而不是每次全盘粗扫。
 func TestCleanupExpiredFilesProcessesOnlySelectedShards(t *testing.T) {
 	server := newTestServer(t)
 
+	// makeExpired 帮我们快速造一个“磁盘上存在但已经过期”的缓存项。
 	makeExpired := func(rawURL string) string {
 		options := server.resolveFetchOptions(rawURL, upstreamFetchOptions{})
 		cacheKey := server.cacheKey(rawURL, options.CacheVariant)
@@ -797,6 +840,8 @@ func TestCleanupExpiredFilesProcessesOnlySelectedShards(t *testing.T) {
 	}
 }
 
+// newTestServer 为测试创建一套尽量轻量、但行为接近生产的 Server。
+// 它会走真实的 NewServer，避免测试绕过初始化逻辑。
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	cacheDir := t.TempDir()
@@ -824,6 +869,8 @@ func newTestServer(t *testing.T) *Server {
 	return server
 }
 
+// rewriteTargetHostClient 用于把“逻辑上访问某个真实域名”的请求改写到本地 httptest server。
+// 这样可以同时保留目标 URL 的 host 信息，又不需要真的访问公网。
 func rewriteTargetHostClient(t *testing.T, upstream *httptest.Server, targetURL string) *http.Client {
 	t.Helper()
 	target, err := url.Parse(targetURL)
@@ -853,6 +900,7 @@ func rewriteTargetHostClient(t *testing.T, upstream *httptest.Server, targetURL 
 	return client
 }
 
+// minimalPNG 返回一段最小可识别的 PNG 字节，用作测试桩。
 func minimalPNG() []byte {
 	return []byte{
 		0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n',
@@ -862,11 +910,13 @@ func minimalPNG() []byte {
 	}
 }
 
+// readCloser 是一个只读一次的测试桩，用来模拟简单响应体。
 type readCloser struct {
 	data []byte
 	read bool
 }
 
+// roundTripFunc 让普通函数也能实现 http.RoundTripper，方便测试时自定义客户端行为。
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -886,6 +936,7 @@ func (r *readCloser) Close() error {
 	return nil
 }
 
+// TestMain 在所有测试结束后清理仓库根目录下可能残留的 data 目录。
 func TestMain(m *testing.M) {
 	code := m.Run()
 	_ = os.RemoveAll(filepath.Join(".", "data"))

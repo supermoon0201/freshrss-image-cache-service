@@ -119,6 +119,138 @@
 - `ETag`
 - `Last-Modified`
 
+## 代码导读
+
+如果你是 Go 初学者，建议不要从工具函数开始零散地看，而是按下面顺序读：
+
+1. 看程序怎么启动
+   先看 `main.go` 里的 `main()` 和 `NewServer()`。
+   这里能看明白服务是怎么读取配置、初始化 HTTP 客户端、启动预热任务和 janitor 的。
+
+2. 看一次请求怎么进来
+   再看 `handlePiccache()`、`handleGet()`、`handleHead()`、`handlePost()`。
+   这一层主要是路由分发，不需要纠结细节，先建立“请求会流到哪里”的地图。
+
+3. 重点看 GET / HEAD 主链路
+   然后看 `handleRead()`。
+   这是最值得先读懂的函数，因为它把“标准化 URL、构造抓取参数、singleflight 去重、返回缓存文件”都串起来了。
+
+4. 看缓存判定核心
+   接着看 `ensureCached()`。
+   这个函数决定一条请求最后是：
+   `HIT`
+   `MISS`
+   `STALE`
+   `REVALIDATED`
+   也就是命中、未命中、过期但先返回旧内容、还是通过 304 重验证。
+
+5. 看真正回源和落盘
+   再看 `fetchAndStore()`、`drainUpstreamBody()`、`serveCachedBlob()`。
+   这里能看懂：
+   为什么先校验内容类型
+   为什么写临时文件再 rename
+   为什么热路径不再用 `ServeFile`
+
+6. 看元数据缓存
+   接着看 `readMeta()`、`readMetaFromMemory()`、`writeMetaToMemory()`、`deleteMetaCache()`。
+   这一组函数解释了为什么高并发 hit 不需要每次都读磁盘上的 `.json`。
+
+7. 看过期和后台刷新
+   然后看 `canServeStale()`、`refreshStaleCache()`、`conditionalHeaders()`、`revalidateMeta()`。
+   这一组是“过期缓存还能先顶住”和“怎么用 304 避免重下整个文件”的关键。
+
+8. 看并发限制
+   再看 `acquireFetchSlots()` 和 `hostSemaphore()`。
+   这里能理解“为什么不仅有全局并发限制，还要有单 host 并发限制”。
+
+9. 看自动推导防盗链请求头
+   再看 `resolveFetchOptions()`、`buildForwardedOptions...()`、`inferUpstreamHeaderOptions()`。
+   这是这个服务适配很多图片源时比较有特色的一块。
+
+10. 最后看后台任务和工具函数
+   收尾时再看 `warmMetaCache()`、`runJanitor()`、`cleanupExpiredFiles()`、`cleanupOversizeCache()` 以及下面的解析工具函数。
+   这时你已经知道主流程了，再看这些辅助逻辑会容易很多。
+
+如果你想结合测试一起看，推荐这样配对：
+
+- 看完 `handleRead()` / `ensureCached()` 后，对照 `main_test.go` 里的 `TestHandleGetForwardsSafeHeadersAndCachesResult`、`TestHandleHeadFetchesAndCachesWithoutBody`
+- 看完 `stale` 和 `revalidate` 逻辑后，对照 `TestEnsureCachedServesStaleAndRefreshesInBackground`、`TestEnsureCachedUsesConditionalRevalidation`
+- 看完内存元数据缓存后，对照 `TestConcurrentCacheHitsUseMemoryMetaCache`、`TestMetaCacheLRUEvictsOldEntries`
+- 看完 janitor 和预热后，对照 `TestWarmMetaCacheLoadsDiskEntries`、`TestCleanupExpiredFilesProcessesOnlySelectedShards`
+
+一个更实用的阅读建议是：
+
+- 第一遍先只看函数注释和函数签名，不追每个分支
+- 第二遍从 `handleRead()` 一路点到 `ensureCached()` 和 `fetchAndStore()`
+- 第三遍再看并发、LRU、janitor 这些“不是先跑通主链路也能暂时放一放”的部分
+
+## 请求流程图
+
+下面这张 Mermaid 流程图描述的是最常见的 `GET / HEAD /piccache?url=...` 主链路：
+
+```mermaid
+flowchart TD
+    A["客户端请求"] --> B["handlePiccache"]
+    B --> C{请求方法}
+    C -->|GET| D["handleGet"]
+    C -->|HEAD| E["handleHead"]
+    D --> F["handleRead"]
+    E --> F
+    F --> G["读取 query 中的 url"]
+    G --> H["normalizeURL<br/>校验 scheme<br/>去掉 fragment"]
+    H --> I["buildForwardedOptionsFromRequest<br/>继承允许透传的上游请求头"]
+    I --> J["resolveFetchOptions<br/>合并默认头、规则头、透传头、自动推导头"]
+    J --> K["计算 cacheKey"]
+    K --> L["singleflight group.Do<br/>同一个 cacheKey 并发去重"]
+    L --> M["ensureCached"]
+    M --> N["readMeta"]
+    N --> O{读到元数据?}
+    O -->|否| U["acquireFetchSlots<br/>申请全局并发和单 host 并发"]
+    O -->|是| P{已过期?}
+    P -->|否| Q["返回 HIT"]
+    P -->|是| R{能走 stale?}
+    R -->|能| S["返回 STALE"]
+    S --> T["后台 refreshStaleCache<br/>refreshGroup 去重刷新"]
+    R -->|不能| U
+    U --> V["再次 readMeta 双检"]
+    V --> W{排队期间别人已写好缓存?}
+    W -->|是, 未过期| Q
+    W -->|是, 但可 stale| S
+    W -->|否| X["fetchAndStore"]
+    X --> Y["doUpstreamRequestWithRetries<br/>必要时在 403 后切换备用 Referer 或 Origin"]
+    Y --> Z{本地已有旧元数据?}
+    Z -->|是| AA["补条件请求头<br/>If-None-Match / If-Modified-Since"]
+    Z -->|否| AB{上游响应状态}
+    AA --> AB
+    AB -->|304| AC["revalidateMeta<br/>刷新 CreatedAt 和 ETag"]
+    AC --> AD["返回 REVALIDATED"]
+    AB -->|200| AE["validateUpstreamBody<br/>校验媒体类型并识别挑战页"]
+    AE --> AF{共享缓存?}
+    AF -->|否| AG["drainUpstreamBody<br/>只读完 body 不落盘"]
+    AG --> AH["返回 MISS"]
+    AF -->|是| AI["写临时文件 .tmp"]
+    AI --> AJ["rename 成正式 .bin"]
+    AJ --> AK["写入 .json 元数据"]
+    AK --> AL["回填内存 LRU"]
+    AL --> AH
+    Q --> AM["handleRead 写响应头"]
+    AD --> AM
+    AH --> AM
+    AM --> AN{是否 HEAD?}
+    AN -->|是| AO["直接返回响应头"]
+    AN -->|否| AP["serveCachedBlob<br/>直接打开 .bin 流式写回"]
+    AO --> AQ["客户端拿到最终响应"]
+    AP --> AQ
+```
+
+如果你想把这张流程图和代码对应起来，推荐对照下面几个函数一起看：
+
+- 入口：`handlePiccache()`、`handleRead()`
+- 缓存判定：`ensureCached()`
+- 回源与落盘：`fetchAndStore()`
+- stale / revalidate：`canServeStale()`、`refreshStaleCache()`、`revalidateMeta()`
+- 文件返回：`serveCachedBlob()`
+
 ## 本地运行
 
 ```bash
