@@ -14,16 +14,16 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags=
 
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates tzdata wget
+RUN apk add --no-cache ca-certificates su-exec tzdata wget
 
 WORKDIR /app
 COPY --from=builder /out/freshrss-image-cache-service /app/freshrss-image-cache-service
+COPY entrypoint.sh /app/entrypoint.sh
 
 RUN addgroup -S app && adduser -S -G app app \
     && mkdir -p /data/cache \
-    && chown -R app:app /app /data
-
-USER app
+    && chown -R app:app /app /data \
+    && chmod +x /app/entrypoint.sh
 
 ENV LISTEN_ADDR=0.0.0.0:9090 \
     CACHE_DIR=/data/cache \
@@ -36,4 +36,4 @@ ENV LISTEN_ADDR=0.0.0.0:9090 \
     UPSTREAM_CONCURRENCY=16
 
 EXPOSE 9090
-CMD ["/app/freshrss-image-cache-service"]
+ENTRYPOINT ["/app/entrypoint.sh"]

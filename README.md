@@ -43,6 +43,8 @@ docker build -t freshrss-image-cache-service .
 docker run --rm -p 9090:9090 freshrss-image-cache-service
 ```
 
+容器启动时会先尝试修复 `CACHE_DIR` 的目录权限，再以 `app` 用户启动主程序。这可以改善宿主机绑定挂载目录时的权限兼容性；如果宿主机启用了更严格的文件系统或安全策略，仍可能需要手动调整目录属主或改用 Docker 命名卷。
+
 ## GitHub 自动构建镜像
 
 仓库已添加 GitHub Actions 工作流：
