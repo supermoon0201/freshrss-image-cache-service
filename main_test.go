@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -405,6 +406,103 @@ func TestEnsureCachedWithSensitiveForwardedHeadersBypassesSharedCache(t *testing
 	}
 }
 
+func TestDefaultConfigUsesHigherUpstreamConcurrency(t *testing.T) {
+	t.Setenv("UPSTREAM_CONCURRENCY", "")
+
+	cfg := defaultConfig()
+	if cfg.UpstreamConcurrency != 64 {
+		t.Fatalf("default UpstreamConcurrency = %d, want 64", cfg.UpstreamConcurrency)
+	}
+}
+
+func TestNewServerTunesTransportForHighConcurrency(t *testing.T) {
+	t.Setenv("UPSTREAM_CONCURRENCY", "")
+
+	cfg := defaultConfig()
+	cfg.CacheDir = t.TempDir()
+	server, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer returned error: %v", err)
+	}
+
+	if got := cap(server.fetchSem); got != 64 {
+		t.Fatalf("fetchSem cap = %d, want 64", got)
+	}
+
+	transport, ok := server.httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("unexpected transport type")
+	}
+	if got := transport.MaxIdleConns; got != 256 {
+		t.Fatalf("MaxIdleConns = %d, want 256", got)
+	}
+	if got := transport.MaxIdleConnsPerHost; got != 64 {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want 64", got)
+	}
+	if got := transport.MaxConnsPerHost; got != 64 {
+		t.Fatalf("MaxConnsPerHost = %d, want 64", got)
+	}
+}
+
+func TestConcurrentCacheHitsUseMemoryMetaCache(t *testing.T) {
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(minimalPNG())
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(t)
+	server.httpClient = upstream.Client()
+
+	if _, err := server.ensureCached(context.Background(), upstream.URL+"/hot.png", upstreamFetchOptions{}); err != nil {
+		t.Fatalf("warm cache returned error: %v", err)
+	}
+
+	var diskReads atomic.Int32
+	server.metaDiskReadHook = func(string) {
+		diskReads.Add(1)
+	}
+
+	const readers = 64
+	var wg sync.WaitGroup
+	results := make(chan cacheResult, readers)
+	errs := make(chan error, readers)
+
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result, err := server.ensureCached(context.Background(), upstream.URL+"/hot.png", upstreamFetchOptions{})
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- result
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("concurrent ensureCached returned error: %v", err)
+	}
+	for result := range results {
+		if result.Status != "HIT" {
+			t.Fatalf("concurrent hit status = %q, want HIT", result.Status)
+		}
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("upstream requests = %d, want 1", got)
+	}
+	if got := diskReads.Load(); got != 0 {
+		t.Fatalf("meta disk reads = %d, want 0", got)
+	}
+}
+
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	cacheDir := t.TempDir()
@@ -423,6 +521,7 @@ func newTestServer(t *testing.T) *Server {
 		},
 		httpClient: &http.Client{Timeout: 5 * time.Second},
 		fetchSem:   make(chan struct{}, 4),
+		metaCache:  make(map[string]Meta),
 	}
 }
 

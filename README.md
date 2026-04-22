@@ -26,7 +26,7 @@
 | `CACHE_TTL` | `720h` | 缓存过期时间 |
 | `JANITOR_INTERVAL` | `1h` | 清理任务执行间隔 |
 | `MAX_CACHE_BYTES` | `10737418240` | 缓存允许的最大总大小 |
-| `UPSTREAM_CONCURRENCY` | `16` | 同时抓取上游资源的并发上限 |
+| `UPSTREAM_CONCURRENCY` | `64` | 同时抓取上游资源的并发上限 |
 | `UPSTREAM_HEADER_RULES_JSON` | 空 | 按域名匹配的上游请求头规则，JSON 数组 |
 | `CREDENTIAL_FORWARD_HOSTS` | 空 | 允许通过 `POST /piccache` 透传 `Cookie`/`Authorization` 的域名白名单，逗号分隔，支持 `*.example.com` |
 

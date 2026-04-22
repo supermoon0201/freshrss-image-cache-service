@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/publicsuffix"
@@ -63,10 +64,13 @@ type Meta struct {
 
 // Server 是图片缓存服务。
 type Server struct {
-	cfg        Config
-	httpClient *http.Client
-	group      singleflight.Group
-	fetchSem   chan struct{}
+	cfg              Config
+	httpClient       *http.Client
+	group            singleflight.Group
+	fetchSem         chan struct{}
+	metaCacheMu      sync.RWMutex
+	metaCache        map[string]Meta
+	metaDiskReadHook func(string)
 }
 
 type cacheResult struct {
@@ -113,20 +117,7 @@ var (
 )
 
 func main() {
-	cfg := Config{
-		ListenAddr:          envOrDefault("LISTEN_ADDR", "127.0.0.1:9090"),
-		CacheDir:            envOrDefault("CACHE_DIR", "./data/cache"),
-		AccessToken:         envOrDefault("ACCESS_TOKEN", "change-me"),
-		FetchTimeout:        parseDurationOrDefault("FETCH_TIMEOUT", 15*time.Second),
-		MaxBodyBytes:        parseInt64OrDefault("MAX_BODY_BYTES", 20<<20), // 20MB
-		CacheTTL:            parseDurationOrDefault("CACHE_TTL", 30*24*time.Hour),
-		JanitorInterval:     parseDurationOrDefault("JANITOR_INTERVAL", time.Hour),
-		MaxCacheBytes:       parseInt64OrDefault("MAX_CACHE_BYTES", 10<<30), // 10GB
-		UpstreamConcurrency: int(parseInt64OrDefault("UPSTREAM_CONCURRENCY", 16)),
-		AllowedSchemes:      map[string]struct{}{"http": {}, "https": {}},
-		UpstreamHeaderRules: parseUpstreamHeaderRules("UPSTREAM_HEADER_RULES_JSON"),
-		CredentialedHosts:   parseCSVEnv("CREDENTIAL_FORWARD_HOSTS"),
-	}
+	cfg := defaultConfig()
 
 	server, err := NewServer(cfg)
 	if err != nil {
@@ -156,11 +147,13 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("mkdir cache dir: %w", err)
 	}
 
+	upstreamConcurrency := normalizeUpstreamConcurrency(cfg.UpstreamConcurrency)
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           safeDialContext,
-		MaxIdleConns:          64,
-		MaxIdleConnsPerHost:   16,
+		MaxIdleConns:          maxInt(128, upstreamConcurrency*4),
+		MaxIdleConnsPerHost:   maxInt(32, upstreamConcurrency),
+		MaxConnsPerHost:       upstreamConcurrency,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: 10 * time.Second,
@@ -172,7 +165,8 @@ func NewServer(cfg Config) (*Server, error) {
 			Transport: transport,
 			Timeout:   cfg.FetchTimeout,
 		},
-		fetchSem: make(chan struct{}, cfg.UpstreamConcurrency),
+		fetchSem:  make(chan struct{}, upstreamConcurrency),
+		metaCache: make(map[string]Meta),
 	}, nil
 }
 
@@ -423,6 +417,7 @@ func (s *Server) fetchAndStore(ctx context.Context, normalizedURL string, option
 		_ = os.Remove(finalPath)
 		return Meta{}, err
 	}
+	s.writeMetaToMemory(cacheKey, meta)
 	log.Printf("upstream fetch ok url=%s mode=%s cache=public", normalizedURL, options.Mode)
 	return meta, nil
 }
@@ -483,22 +478,52 @@ func (s *Server) doUpstreamRequestWithRetries(ctx context.Context, normalizedURL
 }
 
 func (s *Server) readMeta(cacheKey string) (Meta, bool) {
+	if meta, ok := s.readMetaFromMemory(cacheKey); ok {
+		return meta, true
+	}
+
 	metaPath := s.metaPath(cacheKey)
 	blobPath := s.blobPath(cacheKey)
+	if s.metaDiskReadHook != nil {
+		s.metaDiskReadHook(cacheKey)
+	}
 
 	payload, err := os.ReadFile(metaPath)
 	if err != nil {
+		s.deleteMetaCache(cacheKey)
 		return Meta{}, false
 	}
 	if _, err := os.Stat(blobPath); err != nil {
+		s.deleteMetaCache(cacheKey)
 		return Meta{}, false
 	}
 
 	var meta Meta
 	if err := json.Unmarshal(payload, &meta); err != nil {
+		s.deleteMetaCache(cacheKey)
 		return Meta{}, false
 	}
+	s.writeMetaToMemory(cacheKey, meta)
 	return meta, true
+}
+
+func (s *Server) readMetaFromMemory(cacheKey string) (Meta, bool) {
+	s.metaCacheMu.RLock()
+	meta, ok := s.metaCache[cacheKey]
+	s.metaCacheMu.RUnlock()
+	return meta, ok
+}
+
+func (s *Server) writeMetaToMemory(cacheKey string, meta Meta) {
+	s.metaCacheMu.Lock()
+	s.metaCache[cacheKey] = meta
+	s.metaCacheMu.Unlock()
+}
+
+func (s *Server) deleteMetaCache(cacheKey string) {
+	s.metaCacheMu.Lock()
+	delete(s.metaCache, cacheKey)
+	s.metaCacheMu.Unlock()
 }
 
 func (s *Server) isExpired(meta Meta) bool {
@@ -1028,6 +1053,7 @@ func (s *Server) cleanupExpiredFiles() {
 
 		var meta Meta
 		if err := json.Unmarshal(payload, &meta); err != nil {
+			s.deleteMetaCache(cacheKeyFromMetaPath(path))
 			_ = os.Remove(path)
 			_ = os.Remove(strings.TrimSuffix(path, ".json") + ".bin")
 			removed++
@@ -1037,6 +1063,7 @@ func (s *Server) cleanupExpiredFiles() {
 			return nil
 		}
 
+		s.deleteMetaCache(cacheKeyFromMetaPath(path))
 		_ = os.Remove(strings.TrimSuffix(path, ".json") + ".bin")
 		_ = os.Remove(path)
 		removed++
@@ -1115,6 +1142,7 @@ func (s *Server) cleanupOversizeCache() {
 		if total-removedBytes <= s.cfg.MaxCacheBytes {
 			break
 		}
+		s.deleteMetaCache(entry.Key)
 		_ = os.Remove(entry.BlobPath)
 		_ = os.Remove(entry.MetaPath)
 		removedBytes += entry.Length
@@ -1132,6 +1160,41 @@ func envOrDefault(key, defaultValue string) string {
 		return defaultValue
 	}
 	return value
+}
+
+func defaultConfig() Config {
+	return Config{
+		ListenAddr:          envOrDefault("LISTEN_ADDR", "127.0.0.1:9090"),
+		CacheDir:            envOrDefault("CACHE_DIR", "./data/cache"),
+		AccessToken:         envOrDefault("ACCESS_TOKEN", "change-me"),
+		FetchTimeout:        parseDurationOrDefault("FETCH_TIMEOUT", 15*time.Second),
+		MaxBodyBytes:        parseInt64OrDefault("MAX_BODY_BYTES", 20<<20), // 20MB
+		CacheTTL:            parseDurationOrDefault("CACHE_TTL", 30*24*time.Hour),
+		JanitorInterval:     parseDurationOrDefault("JANITOR_INTERVAL", time.Hour),
+		MaxCacheBytes:       parseInt64OrDefault("MAX_CACHE_BYTES", 10<<30), // 10GB
+		UpstreamConcurrency: int(parseInt64OrDefault("UPSTREAM_CONCURRENCY", 64)),
+		AllowedSchemes:      map[string]struct{}{"http": {}, "https": {}},
+		UpstreamHeaderRules: parseUpstreamHeaderRules("UPSTREAM_HEADER_RULES_JSON"),
+		CredentialedHosts:   parseCSVEnv("CREDENTIAL_FORWARD_HOSTS"),
+	}
+}
+
+func normalizeUpstreamConcurrency(value int) int {
+	if value <= 0 {
+		return 1
+	}
+	return value
+}
+
+func cacheKeyFromMetaPath(path string) string {
+	return strings.TrimSuffix(filepath.Base(path), ".json")
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func parseDurationOrDefault(key string, defaultValue time.Duration) time.Duration {
