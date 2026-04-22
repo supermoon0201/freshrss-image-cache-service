@@ -236,6 +236,111 @@ func TestHandleGetForwardsSafeHeadersAndCachesResult(t *testing.T) {
 	}
 }
 
+// TestHandleGetIgnoresUserAgentAndLanguageForSharedCache 验证共享缓存分片默认不再被
+// User-Agent / Accept-Language 切开，只要 Referer / Origin 语义相同就应复用缓存。
+func TestHandleGetIgnoresUserAgentAndLanguageForSharedCache(t *testing.T) {
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if got := r.Header.Get("Referer"); got != "https://hellogithub.com/" {
+			http.Error(w, "missing referer", http.StatusForbidden)
+			return
+		}
+		if got := r.Header.Get("Origin"); got != "https://hellogithub.com" {
+			http.Error(w, "missing origin", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(minimalPNG())
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(t)
+	server.httpClient = upstream.Client()
+
+	firstReq := httptest.NewRequest(http.MethodGet, "/piccache?url="+upstream.URL+"/hello2.png", nil)
+	firstReq.Header.Set("Referer", "https://hellogithub.com/")
+	firstReq.Header.Set("Origin", "https://hellogithub.com")
+	firstReq.Header.Set("User-Agent", "Mozilla/5.0 test-a")
+	firstReq.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+	firstRec := httptest.NewRecorder()
+	server.handleGet(firstRec, firstReq)
+
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("first GET status = %d, want 200; body=%s", firstRec.Code, firstRec.Body.String())
+	}
+	if got := firstRec.Header().Get("X-Piccache-Status"); got != "MISS" {
+		t.Fatalf("first GET X-Piccache-Status = %q, want MISS", got)
+	}
+
+	secondReq := httptest.NewRequest(http.MethodGet, "/piccache?url="+upstream.URL+"/hello2.png", nil)
+	secondReq.Header.Set("Referer", "https://hellogithub.com/")
+	secondReq.Header.Set("Origin", "https://hellogithub.com")
+	secondReq.Header.Set("User-Agent", "Mozilla/5.0 test-b")
+	secondReq.Header.Set("Accept-Language", "en-US,en;q=0.8")
+	secondRec := httptest.NewRecorder()
+	server.handleGet(secondRec, secondReq)
+
+	if secondRec.Code != http.StatusOK {
+		t.Fatalf("second GET status = %d, want 200; body=%s", secondRec.Code, secondRec.Body.String())
+	}
+	if got := secondRec.Header().Get("X-Piccache-Status"); got != "HIT" {
+		t.Fatalf("second GET X-Piccache-Status = %q, want HIT", got)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("upstream requests = %d, want 1", got)
+	}
+}
+
+// TestHandleGetKeepsRefererOriginInSharedCacheVariant 验证共享缓存仍然需要保留
+// Referer / Origin 语义，防止不同来源头互相污染。
+func TestHandleGetKeepsRefererOriginInSharedCacheVariant(t *testing.T) {
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if got := r.Header.Get("Referer"); got != "https://hellogithub.com/" {
+			http.Error(w, "missing referer", http.StatusForbidden)
+			return
+		}
+		if got := r.Header.Get("Origin"); got != "https://hellogithub.com" {
+			http.Error(w, "missing origin", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(minimalPNG())
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(t)
+	server.httpClient = upstream.Client()
+
+	firstReq := httptest.NewRequest(http.MethodGet, "/piccache?url="+upstream.URL+"/hello3.png", nil)
+	firstReq.Header.Set("Referer", "https://hellogithub.com/")
+	firstReq.Header.Set("Origin", "https://hellogithub.com")
+	firstRec := httptest.NewRecorder()
+	server.handleGet(firstRec, firstReq)
+
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("first GET status = %d, want 200; body=%s", firstRec.Code, firstRec.Body.String())
+	}
+	if got := firstRec.Header().Get("X-Piccache-Status"); got != "MISS" {
+		t.Fatalf("first GET X-Piccache-Status = %q, want MISS", got)
+	}
+
+	secondReq := httptest.NewRequest(http.MethodGet, "/piccache?url="+upstream.URL+"/hello3.png", nil)
+	secondReq.Header.Set("Referer", "https://another.example/")
+	secondReq.Header.Set("Origin", "https://another.example")
+	secondRec := httptest.NewRecorder()
+	server.handleGet(secondRec, secondReq)
+
+	if secondRec.Code != http.StatusBadGateway {
+		t.Fatalf("second GET status = %d, want 502; body=%s", secondRec.Code, secondRec.Body.String())
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("upstream requests = %d, want 2", got)
+	}
+}
+
 // TestHandleHeadFetchesAndCachesWithoutBody 验证 HEAD 和 GET 走同一套缓存逻辑，
 // 只是最终不返回 body。
 func TestHandleHeadFetchesAndCachesWithoutBody(t *testing.T) {
@@ -426,6 +531,113 @@ func TestEnsureCachedWithSensitiveForwardedHeadersBypassesSharedCache(t *testing
 	cacheKey := server.cacheKey(upstream.URL+"/private.png", "private")
 	if _, err := os.Stat(server.metaPath(cacheKey)); !os.IsNotExist(err) {
 		t.Fatalf("expected no private cache file, stat err = %v", err)
+	}
+}
+
+// TestHandlePostWarmupSharesCacheKeyWithSubsequentGet 验证 POST 预热和后续 GET
+// 在未显式提供上游头时，能够落到同一份共享缓存，而不是再次 MISS 回源。
+func TestHandlePostWarmupSharesCacheKeyWithSubsequentGet(t *testing.T) {
+	var requests atomic.Int32
+	targetURL := "https://23img.com/i/2026/04/22/demo.jpg"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if got := r.Header.Get("Referer"); got != "https://23img.com/" {
+			http.Error(w, "invalid referer", http.StatusForbidden)
+			return
+		}
+		if got := r.Header.Get("Origin"); got != "https://23img.com" {
+			http.Error(w, "invalid origin", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(minimalPNG())
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(t)
+	server.cfg.AccessToken = "test-token"
+	server.httpClient = rewriteTargetHostClient(t, upstream, targetURL)
+
+	postBody := bytes.NewBufferString(`{"url":"` + targetURL + `","access_token":"test-token"}`)
+	postReq := httptest.NewRequest(http.MethodPost, "/piccache", postBody)
+	postReq.Header.Set("Content-Type", "application/json")
+	postRec := httptest.NewRecorder()
+
+	server.handlePost(postRec, postReq)
+
+	if postRec.Code != http.StatusOK {
+		t.Fatalf("POST status = %d, want 200; body=%s", postRec.Code, postRec.Body.String())
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("upstream requests after POST = %d, want 1", got)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/piccache?url="+url.QueryEscape(targetURL), nil)
+	getRec := httptest.NewRecorder()
+	server.handleGet(getRec, getReq)
+
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200; body=%s", getRec.Code, getRec.Body.String())
+	}
+	if got := getRec.Header().Get("X-Piccache-Status"); got != "HIT" {
+		t.Fatalf("GET X-Piccache-Status = %q, want HIT", got)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("upstream requests after GET = %d, want 1", got)
+	}
+}
+
+// TestHandlePostWarmupMatchesGetWhenRefererOriginEqualInferred 验证 POST 预热走自动推导时，
+// 后续 GET 即使显式带了与推导结果相同的 Referer / Origin，也应命中同一份缓存。
+func TestHandlePostWarmupMatchesGetWhenRefererOriginEqualInferred(t *testing.T) {
+	var requests atomic.Int32
+	targetURL := "https://23img.com/i/2026/04/22/zcxcj9.jpg"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if got := r.Header.Get("Referer"); got != "https://23img.com/" {
+			http.Error(w, "invalid referer", http.StatusForbidden)
+			return
+		}
+		if got := r.Header.Get("Origin"); got != "https://23img.com" {
+			http.Error(w, "invalid origin", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(minimalPNG())
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(t)
+	server.cfg.AccessToken = "test-token"
+	server.httpClient = rewriteTargetHostClient(t, upstream, targetURL)
+
+	postBody := bytes.NewBufferString(`{"url":"` + targetURL + `","access_token":"test-token"}`)
+	postReq := httptest.NewRequest(http.MethodPost, "/piccache", postBody)
+	postReq.Header.Set("Content-Type", "application/json")
+	postRec := httptest.NewRecorder()
+	server.handlePost(postRec, postReq)
+
+	if postRec.Code != http.StatusOK {
+		t.Fatalf("POST status = %d, want 200; body=%s", postRec.Code, postRec.Body.String())
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("upstream requests after POST = %d, want 1", got)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/piccache?url="+url.QueryEscape(targetURL), nil)
+	getReq.Header.Set("Referer", "https://23img.com/")
+	getReq.Header.Set("Origin", "https://23img.com")
+	getRec := httptest.NewRecorder()
+	server.handleGet(getRec, getReq)
+
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200; body=%s", getRec.Code, getRec.Body.String())
+	}
+	if got := getRec.Header().Get("X-Piccache-Status"); got != "HIT" {
+		t.Fatalf("GET X-Piccache-Status = %q, want HIT", got)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("upstream requests after GET = %d, want 1", got)
 	}
 }
 

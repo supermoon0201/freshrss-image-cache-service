@@ -522,8 +522,8 @@ func (s *Server) fetchAndStore(ctx context.Context, normalizedURL string, option
 	defer resp.Body.Close()
 
 	cacheVariant := options.CacheVariant
-	if cacheVariant == "" {
-		cacheVariant = buildCacheVariant(usedHeaders)
+		if cacheVariant == "" {
+			cacheVariant = buildSharedCacheVariant(usedHeaders)
 	}
 	cacheKey := s.cacheKey(normalizedURL, cacheVariant)
 
@@ -1080,6 +1080,16 @@ func (s *Server) resolveFetchOptions(normalizedURL string, forwarded upstreamFet
 		options.Cacheable = forwarded.Cacheable
 	}
 
+	// 如果调用方显式传入的 Referer / Origin 与自动推导结果完全等价，
+	// 就把它视作 inferred 变体，这样 POST 预热与后续 GET 不会因为
+	// “一个是自动推导，一个是显式携带了相同头”而拆成两份缓存。
+	if options.Mode != fetchModeRule && forwarded.Cacheable && matchesInferredAuthorityHeaders(normalizedURL, baseHeaders) {
+		options.Mode = fetchModeInferred
+		options.Headers = baseHeaders
+		options.CacheVariant = buildInferredCacheVariant(normalizedURL, baseHeaders)
+		return options
+	}
+
 	if !hasAuthorityHeaders(baseHeaders) {
 		inferred, retries := inferUpstreamHeaderOptions(normalizedURL, baseHeaders)
 		if len(inferred) > 0 {
@@ -1106,7 +1116,7 @@ func (s *Server) resolveFetchOptions(normalizedURL string, forwarded upstreamFet
 		options.CacheVariant = buildInferredCacheVariant(normalizedURL, options.Headers)
 		return options
 	}
-	options.CacheVariant = buildCacheVariant(options.Headers)
+	options.CacheVariant = buildSharedCacheVariant(options.Headers)
 	return options
 }
 
@@ -1181,7 +1191,7 @@ func (s *Server) buildForwardedOptionsFromMap(normalizedURL string, raw map[stri
 
 	return upstreamFetchOptions{
 		Headers:      forwarded,
-		CacheVariant: buildCacheVariant(forwarded),
+		CacheVariant: buildSharedCacheVariant(forwarded),
 		Cacheable:    cacheable,
 		Mode:         fetchModeForwarded,
 	}, nil
@@ -1214,6 +1224,32 @@ func allowedForwardHeaders(allowSensitive bool) []string {
 // hasAuthorityHeaders 判断当前头里是否已经带了 Referer / Origin。
 func hasAuthorityHeaders(headers map[string]string) bool {
 	return strings.TrimSpace(headers["Referer"]) != "" || strings.TrimSpace(headers["Origin"]) != ""
+}
+
+// matchesInferredAuthorityHeaders 判断“当前头集合”是否与自动推导结果等价。
+// 这里会忽略 Referer / Origin 之外的差异来源，把它们当成 baseHeaders 保留下来，
+// 再尝试重建推导候选；只要完全匹配任一候选，就说明它本质上仍是 inferred 场景。
+func matchesInferredAuthorityHeaders(normalizedURL string, headers map[string]string) bool {
+	if !hasAuthorityHeaders(headers) {
+		return false
+	}
+	baseHeaders := make(map[string]string)
+	for key, value := range headers {
+		if key == "Referer" || key == "Origin" {
+			continue
+		}
+		baseHeaders[key] = value
+	}
+	inferred, retries := inferUpstreamHeaderOptions(normalizedURL, baseHeaders)
+	if equalHeaderMaps(headers, inferred) {
+		return true
+	}
+	for _, retry := range retries {
+		if equalHeaderMaps(headers, retry) {
+			return true
+		}
+	}
+	return false
 }
 
 // hostAllowed 判断目标 host 是否落在白名单模式里。
@@ -1271,7 +1307,7 @@ func (r UpstreamHeaderRule) headerMap() map[string]string {
 
 // cacheVariant 根据规则生成缓存分片变体。
 func (r UpstreamHeaderRule) cacheVariant() string {
-	return buildCacheVariant(r.headerMap())
+	return buildSharedCacheVariant(r.headerMap())
 }
 
 // cloneHeaders 做一份浅拷贝，避免多个调用方共享同一个 map。
@@ -1290,6 +1326,19 @@ func mergeHeaders(base, overlay map[string]string) map[string]string {
 		merged[key] = value
 	}
 	return merged
+}
+
+// equalHeaderMaps 用于比较两组规范化后的请求头是否完全一致。
+func equalHeaderMaps(left, right map[string]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, leftValue := range left {
+		if right[key] != leftValue {
+			return false
+		}
+	}
+	return true
 }
 
 // cloneHeaderList 复制一组 header map。
@@ -1325,6 +1374,26 @@ func buildCacheVariant(headers map[string]string) string {
 	return strings.Join(parts, "\n")
 }
 
+// buildSharedCacheVariant 是共享磁盘缓存真正使用的分片规则。
+// 为了提高命中率，这里默认忽略 User-Agent / Accept-Language；
+// 但仍保留 Referer / Origin，避免不同来源头互相污染。
+func buildSharedCacheVariant(headers map[string]string) string {
+	if len(headers) == 0 {
+		return "anonymous"
+	}
+	filtered := make(map[string]string)
+	for key, value := range headers {
+		if isSensitiveForwardHeader(key) {
+			continue
+		}
+		if key == "User-Agent" || key == "Accept-Language" {
+			continue
+		}
+		filtered[key] = value
+	}
+	return buildCacheVariant(filtered)
+}
+
 // buildInferredCacheVariant 给自动推导 Referer / Origin 的场景生成变体。
 // 这里把 host 纳入变体，避免不同站点的自动推导结果互相污染。
 func buildInferredCacheVariant(normalizedURL string, headers map[string]string) string {
@@ -1338,10 +1407,13 @@ func buildInferredCacheVariant(normalizedURL string, headers map[string]string) 
 		if key == "Referer" || key == "Origin" || isSensitiveForwardHeader(key) {
 			continue
 		}
+		if key == "User-Agent" || key == "Accept-Language" {
+			continue
+		}
 		filtered[key] = value
 	}
 	variant := "inferred-host=" + host
-	extra := buildCacheVariant(filtered)
+	extra := buildSharedCacheVariant(filtered)
 	if extra == "anonymous" {
 		return variant
 	}
