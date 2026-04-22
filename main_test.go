@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -271,6 +272,98 @@ func TestHandleHeadFetchesAndCachesWithoutBody(t *testing.T) {
 	}
 }
 
+func TestInferUpstreamHeadersFromURL(t *testing.T) {
+	headers := inferUpstreamHeaders("https://img.hellogithub.com/i/z5ncAjLHSpGDTr1_1771822196.png")
+	if got := headers["Referer"]; got != "https://hellogithub.com/" {
+		t.Fatalf("Referer = %q, want %q", got, "https://hellogithub.com/")
+	}
+	if got := headers["Origin"]; got != "https://hellogithub.com" {
+		t.Fatalf("Origin = %q, want %q", got, "https://hellogithub.com")
+	}
+}
+
+func TestHandleGetInfersHeadersFromTargetURL(t *testing.T) {
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if got := r.Header.Get("Referer"); got != "https://hellogithub.com/" {
+			http.Error(w, "invalid referer", http.StatusForbidden)
+			return
+		}
+		if got := r.Header.Get("Origin"); got != "https://hellogithub.com" {
+			http.Error(w, "invalid origin", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(minimalPNG())
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(t)
+	server.httpClient = upstream.Client()
+
+	targetURL := "https://img.hellogithub.com/i/demo.png"
+	server.httpClient = rewriteTargetHostClient(t, upstream, targetURL)
+
+	req := httptest.NewRequest(http.MethodGet, "/piccache?url="+targetURL, nil)
+	rec := httptest.NewRecorder()
+
+	server.handleGet(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Piccache-Status"); got != "MISS" {
+		t.Fatalf("GET X-Piccache-Status = %q, want MISS", got)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("upstream requests = %d, want 1", got)
+	}
+}
+
+func TestFetchAndStoreFallsBackToHostRootHeadersOn403(t *testing.T) {
+	var requests atomic.Int32
+	targetURL := "https://cdn.assets.example.co.uk/img/demo.png"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch requests.Add(1) {
+		case 1:
+			if got := r.Header.Get("Referer"); got != "https://example.co.uk/" {
+				http.Error(w, "unexpected first referer", http.StatusForbidden)
+				return
+			}
+			http.Error(w, "need host referer", http.StatusForbidden)
+		case 2:
+			if got := r.Header.Get("Referer"); got != "https://cdn.assets.example.co.uk/" {
+				http.Error(w, "unexpected fallback referer", http.StatusForbidden)
+				return
+			}
+			if got := r.Header.Get("Origin"); got != "https://cdn.assets.example.co.uk" {
+				http.Error(w, "unexpected fallback origin", http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(minimalPNG())
+		default:
+			t.Fatalf("unexpected request count = %d", requests.Load())
+		}
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(t)
+	server.httpClient = rewriteTargetHostClient(t, upstream, targetURL)
+
+	result, err := server.ensureCached(context.Background(), targetURL, upstreamFetchOptions{})
+	if err != nil {
+		t.Fatalf("ensureCached returned error: %v", err)
+	}
+	if result.Status != "MISS" {
+		t.Fatalf("ensureCached status = %q, want MISS", result.Status)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("upstream requests = %d, want 2", got)
+	}
+}
+
 func TestEnsureCachedWithSensitiveForwardedHeadersBypassesSharedCache(t *testing.T) {
 	var requests atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -333,6 +426,35 @@ func newTestServer(t *testing.T) *Server {
 	}
 }
 
+func rewriteTargetHostClient(t *testing.T, upstream *httptest.Server, targetURL string) *http.Client {
+	t.Helper()
+	target, err := url.Parse(targetURL)
+	if err != nil {
+		t.Fatalf("parse target url: %v", err)
+	}
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+	baseTransport, ok := upstream.Client().Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("unexpected upstream transport type")
+	}
+	clone := baseTransport.Clone()
+	clone.Proxy = nil
+	client := &http.Client{
+		Timeout: upstream.Client().Timeout,
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			rewritten := req.Clone(req.Context())
+			rewritten.URL.Scheme = upstreamURL.Scheme
+			rewritten.URL.Host = upstreamURL.Host
+			rewritten.Host = target.Host
+			return clone.RoundTrip(rewritten)
+		}),
+	}
+	return client
+}
+
 func minimalPNG() []byte {
 	return []byte{
 		0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n',
@@ -345,6 +467,12 @@ func minimalPNG() []byte {
 type readCloser struct {
 	data []byte
 	read bool
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
 }
 
 func (r *readCloser) Read(p []byte) (int, error) {

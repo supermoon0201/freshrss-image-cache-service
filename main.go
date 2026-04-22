@@ -20,8 +20,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
+
+	"golang.org/x/net/publicsuffix"
+	"golang.org/x/sync/singleflight"
 )
 
 // Config 定义服务配置。
@@ -63,7 +65,7 @@ type Meta struct {
 type Server struct {
 	cfg        Config
 	httpClient *http.Client
-	group      FlightGroup
+	group      singleflight.Group
 	fetchSem   chan struct{}
 }
 
@@ -85,6 +87,7 @@ const (
 	fetchModeAnonymous fetchMode = "anonymous"
 	fetchModeRule      fetchMode = "rule"
 	fetchModeForwarded fetchMode = "forwarded"
+	fetchModeInferred  fetchMode = "inferred"
 )
 
 type upstreamFetchOptions struct {
@@ -92,44 +95,7 @@ type upstreamFetchOptions struct {
 	CacheVariant string
 	Cacheable    bool
 	Mode         fetchMode
-}
-
-// FlightGroup 是最小版 singleflight。
-// 生产环境可替换为 golang.org/x/sync/singleflight。
-type FlightGroup struct {
-	mu sync.Mutex
-	m  map[string]*flightCall
-}
-
-type flightCall struct {
-	wg  sync.WaitGroup
-	val any
-	err error
-}
-
-func (g *FlightGroup) Do(key string, fn func() (any, error)) (any, error, bool) {
-	g.mu.Lock()
-	if g.m == nil {
-		g.m = make(map[string]*flightCall)
-	}
-	if call, ok := g.m[key]; ok {
-		g.mu.Unlock()
-		call.wg.Wait()
-		return call.val, call.err, true
-	}
-
-	call := &flightCall{}
-	call.wg.Add(1)
-	g.m[key] = call
-	g.mu.Unlock()
-
-	call.val, call.err = fn()
-	call.wg.Done()
-
-	g.mu.Lock()
-	delete(g.m, key)
-	g.mu.Unlock()
-	return call.val, call.err, false
+	RetryHeaders []map[string]string
 }
 
 type cacheEntry struct {
@@ -152,7 +118,7 @@ func main() {
 		CacheDir:            envOrDefault("CACHE_DIR", "./data/cache"),
 		AccessToken:         envOrDefault("ACCESS_TOKEN", "change-me"),
 		FetchTimeout:        parseDurationOrDefault("FETCH_TIMEOUT", 15*time.Second),
-		MaxBodyBytes:        parseInt64OrDefault("MAX_BODY_BYTES", 20<<20),     // 20MB
+		MaxBodyBytes:        parseInt64OrDefault("MAX_BODY_BYTES", 20<<20), // 20MB
 		CacheTTL:            parseDurationOrDefault("CACHE_TTL", 30*24*time.Hour),
 		JanitorInterval:     parseDurationOrDefault("JANITOR_INTERVAL", time.Hour),
 		MaxCacheBytes:       parseInt64OrDefault("MAX_CACHE_BYTES", 10<<30), // 10GB
@@ -388,15 +354,13 @@ func (s *Server) ensureCached(ctx context.Context, normalizedURL string, forward
 }
 
 func (s *Server) fetchAndStore(ctx context.Context, normalizedURL string, options upstreamFetchOptions) (Meta, error) {
-	resp, err := s.doUpstreamRequest(ctx, normalizedURL, options.Headers)
+	attemptHeaders := append([]map[string]string{cloneHeaders(options.Headers)}, cloneHeaderList(options.RetryHeaders)...)
+	resp, usedHeaders, err := s.doUpstreamRequestWithRetries(ctx, normalizedURL, attemptHeaders, options.Mode)
 	if err != nil {
 		return Meta{}, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusForbidden && len(options.Headers) > 0 && options.Mode != fetchModeAnonymous {
-		log.Printf("upstream 403 url=%s mode=%s", normalizedURL, options.Mode)
-	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return Meta{}, fmt.Errorf("upstream status: %s", resp.Status)
 	}
@@ -406,7 +370,11 @@ func (s *Server) fetchAndStore(ctx context.Context, normalizedURL string, option
 		return Meta{}, err
 	}
 
-	cacheKey := s.cacheKey(normalizedURL, options.CacheVariant)
+	cacheVariant := options.CacheVariant
+	if cacheVariant == "" {
+		cacheVariant = buildCacheVariant(usedHeaders)
+	}
+	cacheKey := s.cacheKey(normalizedURL, cacheVariant)
 	if !options.Cacheable {
 		return s.drainUpstreamBody(normalizedURL, cacheKey, contentType, bodyReader)
 	}
@@ -493,6 +461,27 @@ func (s *Server) doUpstreamRequest(ctx context.Context, normalizedURL string, he
 	return s.httpClient.Do(req)
 }
 
+func (s *Server) doUpstreamRequestWithRetries(ctx context.Context, normalizedURL string, headerAttempts []map[string]string, mode fetchMode) (*http.Response, map[string]string, error) {
+	if len(headerAttempts) == 0 {
+		headerAttempts = []map[string]string{{}}
+	}
+	var lastResp *http.Response
+	for idx, headers := range headerAttempts {
+		resp, err := s.doUpstreamRequest(ctx, normalizedURL, headers)
+		if err != nil {
+			return nil, nil, err
+		}
+		if resp.StatusCode == http.StatusForbidden && idx < len(headerAttempts)-1 {
+			log.Printf("upstream 403 url=%s mode=%s retry=%d", normalizedURL, mode, idx+1)
+			_ = resp.Body.Close()
+			continue
+		}
+		lastResp = resp
+		return lastResp, headers, nil
+	}
+	return lastResp, headerAttempts[len(headerAttempts)-1], nil
+}
+
 func (s *Server) readMeta(cacheKey string) (Meta, bool) {
 	metaPath := s.metaPath(cacheKey)
 	blobPath := s.blobPath(cacheKey)
@@ -552,19 +541,43 @@ func (s *Server) resolveFetchOptions(normalizedURL string, forwarded upstreamFet
 		options.CacheVariant = rule.cacheVariant()
 		options.Mode = fetchModeRule
 	}
+
+	baseHeaders := cloneHeaders(options.Headers)
+	if len(forwarded.Headers) > 0 {
+		baseHeaders = mergeHeaders(baseHeaders, forwarded.Headers)
+		if options.Mode != fetchModeRule {
+			options.Mode = fetchModeForwarded
+		}
+		options.Cacheable = forwarded.Cacheable
+	}
+
+	if !hasAuthorityHeaders(baseHeaders) {
+		inferred, retries := inferUpstreamHeaderOptions(normalizedURL, baseHeaders)
+		if len(inferred) > 0 {
+			baseHeaders = inferred
+			options.RetryHeaders = retries
+			if options.Mode == fetchModeAnonymous || options.Mode == fetchModeForwarded {
+				options.Mode = fetchModeInferred
+			}
+		}
+	}
+
+	options.Headers = baseHeaders
 	if len(forwarded.Headers) == 0 {
+		if options.Mode == fetchModeInferred {
+			options.CacheVariant = buildInferredCacheVariant(normalizedURL, options.Headers)
+		}
 		return options
 	}
-
-	options.Headers = mergeHeaders(options.Headers, forwarded.Headers)
-	options.Mode = fetchModeForwarded
-	options.Cacheable = forwarded.Cacheable
-	if forwarded.Cacheable {
-		options.CacheVariant = buildCacheVariant(options.Headers)
+	if !forwarded.Cacheable {
+		options.CacheVariant = "private"
 		return options
 	}
-
-	options.CacheVariant = "private"
+	if options.Mode == fetchModeInferred {
+		options.CacheVariant = buildInferredCacheVariant(normalizedURL, options.Headers)
+		return options
+	}
+	options.CacheVariant = buildCacheVariant(options.Headers)
 	return options
 }
 
@@ -661,6 +674,10 @@ func allowedForwardHeaders(allowSensitive bool) []string {
 	return headers
 }
 
+func hasAuthorityHeaders(headers map[string]string) bool {
+	return strings.TrimSpace(headers["Referer"]) != "" || strings.TrimSpace(headers["Origin"]) != ""
+}
+
 func hostAllowed(host string, patterns []string) bool {
 	if len(patterns) == 0 {
 		return false
@@ -731,6 +748,14 @@ func mergeHeaders(base, overlay map[string]string) map[string]string {
 	return merged
 }
 
+func cloneHeaderList(items []map[string]string) []map[string]string {
+	cloned := make([]map[string]string, 0, len(items))
+	for _, item := range items {
+		cloned = append(cloned, cloneHeaders(item))
+	}
+	return cloned
+}
+
 func buildCacheVariant(headers map[string]string) string {
 	if len(headers) == 0 {
 		return "anonymous"
@@ -751,6 +776,92 @@ func buildCacheVariant(headers map[string]string) string {
 		parts = append(parts, key+"="+headers[key])
 	}
 	return strings.Join(parts, "\n")
+}
+
+func buildInferredCacheVariant(normalizedURL string, headers map[string]string) string {
+	parsed, err := url.Parse(normalizedURL)
+	host := normalizedURL
+	if err == nil {
+		host = strings.ToLower(parsed.Hostname())
+	}
+	filtered := make(map[string]string)
+	for key, value := range headers {
+		if key == "Referer" || key == "Origin" || isSensitiveForwardHeader(key) {
+			continue
+		}
+		filtered[key] = value
+	}
+	variant := "inferred-host=" + host
+	extra := buildCacheVariant(filtered)
+	if extra == "anonymous" {
+		return variant
+	}
+	return variant + "\n" + extra
+}
+
+func inferUpstreamHeaders(normalizedURL string) map[string]string {
+	headers, _ := inferUpstreamHeaderOptions(normalizedURL, map[string]string{})
+	return headers
+}
+
+func inferUpstreamHeaderOptions(normalizedURL string, baseHeaders map[string]string) (map[string]string, []map[string]string) {
+	parsed, err := url.Parse(normalizedURL)
+	if err != nil {
+		return nil, nil
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme == "" {
+		return nil, nil
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" {
+		return nil, nil
+	}
+
+	rootHost := registrableHost(host)
+	candidates := make([]map[string]string, 0, 2)
+	candidates = append(candidates, authorityHeaders(scheme, rootHost))
+	if host != rootHost {
+		candidates = append(candidates, authorityHeaders(scheme, host))
+	}
+
+	var attempts []map[string]string
+	seen := make(map[string]struct{})
+	for _, candidate := range candidates {
+		merged := mergeHeaders(baseHeaders, candidate)
+		key := buildCacheVariant(merged)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		attempts = append(attempts, merged)
+	}
+	if len(attempts) == 0 {
+		return nil, nil
+	}
+	if len(attempts) == 1 {
+		return attempts[0], nil
+	}
+	return attempts[0], attempts[1:]
+}
+
+func authorityHeaders(scheme, host string) map[string]string {
+	origin := scheme + "://" + host
+	return map[string]string{
+		"Origin":  origin,
+		"Referer": origin + "/",
+	}
+}
+
+func registrableHost(host string) string {
+	if host == "" {
+		return host
+	}
+	root, err := publicsuffix.EffectiveTLDPlusOne(host)
+	if err == nil && root != "" {
+		return strings.ToLower(root)
+	}
+	return strings.ToLower(host)
 }
 
 // safeDialContext 禁止访问私网、回环等地址，避免 SSRF。

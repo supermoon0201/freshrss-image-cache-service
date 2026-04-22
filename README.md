@@ -10,7 +10,7 @@
 - 提供 `POST /piccache` 主动预热缓存，需传入 `url` 和 `access_token`
 - 支持按域名配置上游请求头，例如 `Referer`、`Origin`、`User-Agent`、`Accept-Language`
 - 支持 `POST /piccache` 受控透传白名单请求头到上游，适配需要登录态或动态 `Referer` 的图片源
-- 支持 `GET /piccache` 从当前请求继承非敏感白名单头到上游，适配基于 `Referer` / `Origin` 的防盗链
+- 支持 `GET /piccache` 从当前请求继承非敏感白名单头到上游；若未提供 `Referer` / `Origin`，会从目标 URL 自动推导并在 403 时有限回退
 - 内置 SSRF 防护，拒绝访问私网、回环、链路本地、多播和未指定地址
 - 采用磁盘分片缓存，并支持 TTL 过期清理和最大容量淘汰
 
@@ -86,7 +86,12 @@
 - `User-Agent`
 - `Accept-Language`
 
-这意味着如果上游图片源基于 `Referer` 防盗链，调用方只要请求本服务时带上正确的 `Referer`，首次 `GET` 也可以直接抓图并缓存。
+如果当前请求没有显式提供 `Referer` / `Origin`，服务会基于目标 URL 自动推导：
+
+- 优先尝试注册域根站点，例如 `https://hellogithub.com/`
+- 若上游返回 `403 Forbidden`，再回退尝试目标 host 根路径，例如 `https://img.hellogithub.com/`
+
+这意味着像 `https://img.hellogithub.com/...` 这类基于主站 `Referer` 防盗链的图片源，即使调用方不手工补头，首次 `GET` 也有机会直接抓图并缓存。
 
 ## HEAD 探测
 
@@ -122,6 +127,8 @@ go test ./...
 docker build -t freshrss-image-cache-service .
 docker run --rm -p 9090:9090 freshrss-image-cache-service
 ```
+
+当前 Docker 构建阶段使用 Go 1.25，与仓库中的 `go.mod` 版本要求保持一致。
 
 容器启动时会先尝试修复 `CACHE_DIR` 的目录权限，再以 `app` 用户启动主程序。这可以改善宿主机绑定挂载目录时的权限兼容性；如果宿主机启用了更严格的文件系统或安全策略，仍可能需要手动调整目录属主或改用 Docker 命名卷。
 
