@@ -1,0 +1,31 @@
+services:
+  freshrss-image-cache-service:
+    build:
+      context: ./freshrss-image-cache-service
+      dockerfile: Dockerfile
+    container_name: freshrss-image-cache-service
+    restart: unless-stopped
+    environment:
+      LISTEN_ADDR: 0.0.0.0:9090
+      CACHE_DIR: /data/cache
+      ACCESS_TOKEN: "please-change-this"
+      FETCH_TIMEOUT: 15s
+      MAX_BODY_BYTES: 20971520
+      CACHE_TTL: 720h
+      JANITOR_INTERVAL: 1h
+      MAX_CACHE_BYTES: 10737418240
+      UPSTREAM_CONCURRENCY: 16
+    volumes:
+      - ./data/cache:/data/cache
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - app_net
+
+networks:
+  app_net:
+    driver: bridge

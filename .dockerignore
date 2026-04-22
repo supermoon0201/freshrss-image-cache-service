@@ -1,0 +1,7 @@
+.git
+.ace-tool
+data
+*.log
+*.tmp
+*.out
+coverage.txt
