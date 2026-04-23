@@ -19,6 +19,50 @@
 - 支持条件回源校验和单 host 并发限制，降低热点回源压力
 - 支持优雅停机，收到 `SIGINT` / `SIGTERM` 后会先停止后台预热与 janitor，再在超时窗口内关闭 HTTP 服务
 
+## 缓存布局
+
+磁盘缓存采用“两级 shard 目录 + 一对文件”的布局：
+
+- 二进制响应体写入 `*.bin`
+- 元数据写入紧凑的 `*.meta`
+- `cacheKey` 前两级前缀会被拆成目录，避免单目录文件过多
+
+例如：
+
+```text
+cache/
+  ab/
+    cd/
+      abcd1234.meta
+      abcd1234.bin
+```
+
+之所以把元数据从 JSON 改成紧凑的 `.meta`，主要是为了降低以下路径的编解码和磁盘字节量：
+
+- `MISS` / `REVALIDATED` 时的元数据写盘
+- 冷命中回读元数据
+- 启动预热 `warmMetaCache()`
+- janitor 的过期清理和容量扫描
+
+## 后台扫描策略
+
+当前版本没有维护单独的索引文件，而是把“磁盘目录本身”作为事实来源。
+
+后台预热和 janitor 的做法是：
+
+- 先列出所有 shard 目录
+- 再对每个 shard 用一次 `ReadDir`
+- 同时收集该目录下的 `.meta` 和 `.bin`
+- 通过文件名反推出 `cacheKey`
+- 尽量直接复用目录项信息，减少重复 `stat` 和重复路径拼接
+
+这样做的取舍是：
+
+- 优点是实现简单、状态一致性更直接，不需要维护额外索引
+- 缺点是后台任务仍然需要枚举真实文件，缓存规模很大时扫描成本会继续上升
+
+为了进一步减少后台扫描开销，当前实现还会把 `.meta` 文件的 `ModTime` 对齐到 `Meta.CreatedAt`，让 janitor 和预热可以先用文件时间判断是否过期，再决定是否需要解码元数据。
+
 ## 环境变量
 
 | 变量名 | 默认值 | 说明 |
@@ -157,7 +201,7 @@
 
 6. 看元数据缓存
    接着看 `readMeta()`、`readMetaFromMemory()`、`writeMetaToMemory()`、`deleteMetaCache()`。
-   这一组函数解释了为什么高并发 hit 不需要每次都读磁盘上的 `.json`。
+   这一组函数解释了为什么高并发 hit 不需要每次都读磁盘上的 `.meta`。
 
 7. 看过期和后台刷新
    然后看 `canServeStale()`、`refreshStaleCache()`、`conditionalHeaders()`、`revalidateMeta()`。
@@ -239,7 +283,7 @@ flowchart TD
     AG --> AH["返回 MISS"]
     AF -->|是| AI["写临时文件 .tmp"]
     AI --> AJ["rename 成正式 .bin"]
-    AJ --> AK["写入 .json 元数据"]
+    AJ --> AK["写入 .meta 元数据"]
     AK --> AL["回填内存 LRU"]
     AL --> AH
     Q --> AM["handleRead 写响应头"]
@@ -259,6 +303,25 @@ flowchart TD
 - 回源与落盘：`fetchAndStore()`
 - stale / revalidate：`canServeStale()`、`refreshStaleCache()`、`revalidateMeta()`
 - 文件返回：`serveCachedBlob()`
+
+## 后台维护链路
+
+如果你准备看预热、janitor 和容量淘汰，推荐按下面顺序看：
+
+1. `listShardDirs()` 和 `listShardFiles()`
+   先建立“后台任务如何枚举磁盘缓存”的地图。
+
+2. `isExpiredFromTime()`
+   这是后台路径为什么能先看 `.meta` 文件时间、少解码元数据的关键。
+
+3. `warmMetaCache()`
+   看启动后如何把磁盘上的热点元数据搬回进程内 LRU。
+
+4. `cleanupExpiredFiles()` 和 `scanCacheEntries()`
+   前者负责 TTL 过期清理，后者负责容量扫描。
+
+5. `cleanupOversizeCache()`
+   最后看容量超限时怎样按最旧文件优先淘汰。
 
 ## 本地运行
 

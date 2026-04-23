@@ -5,6 +5,7 @@ import (
 	"container/list"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -70,7 +72,7 @@ type UpstreamHeaderRule struct {
 }
 
 // Meta 存放缓存元数据。
-// 它既会落到磁盘上的 .json 文件，也会进入进程内存中的元数据缓存。
+// 它既会落到磁盘上的 .meta 文件，也会进入进程内存中的元数据缓存。
 // 其中：
 // - ETag 是本服务自己生成的缓存版本号，给客户端做条件请求用。
 // - UpstreamETag / UpstreamLastModified 是上游服务返回的值，给回源重验证用。
@@ -118,15 +120,17 @@ type Server struct {
 // metaCacheEntry 是 LRU 链表里的节点内容。
 // map 负责 O(1) 定位，list 负责记录冷热顺序。
 type metaCacheEntry struct {
-	Key  string
-	Meta Meta
+	Key          string
+	Meta         Meta
+	LastPromoted int64
 }
 
 // blobCacheEntry 保存“小而热”的图片内容。
 // 这样高并发命中时可以直接从内存回写，减少磁盘打开和读取。
 type blobCacheEntry struct {
-	Key  string
-	Blob []byte
+	Key          string
+	Blob         []byte
+	LastPromoted int64
 }
 
 type cacheResult struct {
@@ -145,6 +149,11 @@ type fetchMode string
 
 const (
 	defaultAccessToken = "change-me"
+	// cachePromotionInterval 控制内存 LRU 在热点命中时多久才真正提升一次顺序。
+	// 这样可以减少“每次命中都抢写锁 MoveToFront”带来的锁竞争。
+	cachePromotionInterval = 250 * time.Millisecond
+	metaFileMagic          = "PCM1"
+	currentMetaSuffix      = ".meta"
 
 	// anonymous 表示完全匿名抓取，不额外补特殊请求头。
 	fetchModeAnonymous fetchMode = "anonymous"
@@ -168,7 +177,6 @@ type upstreamFetchOptions struct {
 
 type cacheEntry struct {
 	Key        string
-	BlobPath   string
 	MetaPath   string
 	Length     int64
 	ModifiedAt time.Time
@@ -670,7 +678,7 @@ func (s *Server) fetchAndStore(ctx context.Context, normalizedURL string, option
 		UpstreamETag:         strings.TrimSpace(resp.Header.Get("ETag")),
 		UpstreamLastModified: strings.TrimSpace(resp.Header.Get("Last-Modified")),
 	}
-	if err := writeJSONAtomic(s.metaPath(cacheKey), meta); err != nil {
+	if err := writeMetaAtomic(s.metaPath(cacheKey), meta); err != nil {
 		_ = os.Remove(finalPath)
 		return Meta{}, false, err
 	}
@@ -740,20 +748,19 @@ func (s *Server) doUpstreamRequestWithRetries(ctx context.Context, normalizedURL
 	return lastResp, headerAttempts[len(headerAttempts)-1], nil
 }
 
-// readMeta 优先读内存 LRU，读不到再回退到磁盘上的 .json。
+// readMeta 优先读内存 LRU，读不到再回退到磁盘上的紧凑元数据文件。
 // 这就是高并发 hit 场景能变快的关键之一。
 func (s *Server) readMeta(cacheKey string) (Meta, bool) {
 	if meta, ok := s.readMetaFromMemory(cacheKey); ok {
 		return meta, true
 	}
 
-	metaPath := s.metaPath(cacheKey)
 	blobPath := s.blobPath(cacheKey)
 	if s.metaDiskReadHook != nil {
 		s.metaDiskReadHook(cacheKey)
 	}
 
-	payload, err := os.ReadFile(metaPath)
+	meta, err := readMetaFile(s.metaPath(cacheKey))
 	if err != nil {
 		s.deleteMetaCache(cacheKey)
 		return Meta{}, false
@@ -763,11 +770,6 @@ func (s *Server) readMeta(cacheKey string) (Meta, bool) {
 		return Meta{}, false
 	}
 
-	var meta Meta
-	if err := json.Unmarshal(payload, &meta); err != nil {
-		s.deleteMetaCache(cacheKey)
-		return Meta{}, false
-	}
 	s.writeMetaToMemory(cacheKey, meta)
 	return meta, true
 }
@@ -775,16 +777,29 @@ func (s *Server) readMeta(cacheKey string) (Meta, bool) {
 // readMetaFromMemory 从 LRU 中取元数据，并把命中的节点提到队头。
 func (s *Server) readMetaFromMemory(cacheKey string) (Meta, bool) {
 	s.metaCacheMu.RLock()
-	_, ok := s.metaCache[cacheKey]
-	s.metaCacheMu.RUnlock()
+	current, ok := s.metaCache[cacheKey]
 	if !ok {
+		s.metaCacheMu.RUnlock()
 		return Meta{}, false
+	}
+	entry := current.Value.(*metaCacheEntry)
+	meta := entry.Meta
+	lastPromoted := atomic.LoadInt64(&entry.LastPromoted)
+	s.metaCacheMu.RUnlock()
+
+	now := time.Now()
+	if now.UnixNano()-lastPromoted < cachePromotionInterval.Nanoseconds() {
+		return meta, true
 	}
 
 	s.metaCacheMu.Lock()
 	if current, ok := s.metaCache[cacheKey]; ok {
-		s.metaCacheList.MoveToFront(current)
-		meta := current.Value.(*metaCacheEntry).Meta
+		entry := current.Value.(*metaCacheEntry)
+		if now.UnixNano()-atomic.LoadInt64(&entry.LastPromoted) >= cachePromotionInterval.Nanoseconds() {
+			s.metaCacheList.MoveToFront(current)
+			atomic.StoreInt64(&entry.LastPromoted, now.UnixNano())
+		}
+		meta := entry.Meta
 		s.metaCacheMu.Unlock()
 		return meta, true
 	}
@@ -797,12 +812,14 @@ func (s *Server) readMetaFromMemory(cacheKey string) (Meta, bool) {
 func (s *Server) writeMetaToMemory(cacheKey string, meta Meta) {
 	s.metaCacheMu.Lock()
 	if element, ok := s.metaCache[cacheKey]; ok {
-		element.Value.(*metaCacheEntry).Meta = meta
+		entry := element.Value.(*metaCacheEntry)
+		entry.Meta = meta
+		atomic.StoreInt64(&entry.LastPromoted, time.Now().UnixNano())
 		s.metaCacheList.MoveToFront(element)
 		s.metaCacheMu.Unlock()
 		return
 	}
-	entry := &metaCacheEntry{Key: cacheKey, Meta: meta}
+	entry := &metaCacheEntry{Key: cacheKey, Meta: meta, LastPromoted: time.Now().UnixNano()}
 	element := s.metaCacheList.PushFront(entry)
 	s.metaCache[cacheKey] = element
 	for s.cfg.MetaCacheEntries > 0 && s.metaCacheList.Len() > s.cfg.MetaCacheEntries {
@@ -854,7 +871,7 @@ func (s *Server) revalidateMeta(cacheKey string, existing Meta, headers http.Hea
 	if modified := strings.TrimSpace(headers.Get("Last-Modified")); modified != "" {
 		existing.UpstreamLastModified = modified
 	}
-	if err := writeJSONAtomic(s.metaPath(cacheKey), existing); err != nil {
+	if err := writeMetaAtomic(s.metaPath(cacheKey), existing); err != nil {
 		return Meta{}, err
 	}
 	s.writeMetaToMemory(cacheKey, existing)
@@ -919,20 +936,32 @@ func (s *Server) shouldCacheBlob(length int64) bool {
 // readBlobFromMemory 从 LRU 中取热点小文件。
 func (s *Server) readBlobFromMemory(cacheKey string) ([]byte, bool) {
 	s.blobCacheMu.RLock()
-	_, ok := s.blobCache[cacheKey]
-	s.blobCacheMu.RUnlock()
+	current, ok := s.blobCache[cacheKey]
 	if !ok {
+		s.blobCacheMu.RUnlock()
 		return nil, false
+	}
+	entry := current.Value.(*blobCacheEntry)
+	blob := entry.Blob
+	lastPromoted := atomic.LoadInt64(&entry.LastPromoted)
+	s.blobCacheMu.RUnlock()
+
+	now := time.Now()
+	if now.UnixNano()-lastPromoted < cachePromotionInterval.Nanoseconds() {
+		return blob, true
 	}
 
 	s.blobCacheMu.Lock()
 	defer s.blobCacheMu.Unlock()
-	current, ok := s.blobCache[cacheKey]
+	current, ok = s.blobCache[cacheKey]
 	if !ok {
 		return nil, false
 	}
-	s.blobCacheList.MoveToFront(current)
-	entry := current.Value.(*blobCacheEntry)
+	entry = current.Value.(*blobCacheEntry)
+	if now.UnixNano()-atomic.LoadInt64(&entry.LastPromoted) >= cachePromotionInterval.Nanoseconds() {
+		s.blobCacheList.MoveToFront(current)
+		atomic.StoreInt64(&entry.LastPromoted, now.UnixNano())
+	}
 	return entry.Blob, true
 }
 
@@ -948,10 +977,11 @@ func (s *Server) writeBlobToMemory(cacheKey string, blob []byte) {
 		entry := element.Value.(*blobCacheEntry)
 		s.blobCacheBytes += int64(len(blob) - len(entry.Blob))
 		entry.Blob = append(entry.Blob[:0], blob...)
+		atomic.StoreInt64(&entry.LastPromoted, time.Now().UnixNano())
 		s.blobCacheList.MoveToFront(element)
 	} else {
 		copied := append([]byte(nil), blob...)
-		entry := &blobCacheEntry{Key: cacheKey, Blob: copied}
+		entry := &blobCacheEntry{Key: cacheKey, Blob: copied, LastPromoted: time.Now().UnixNano()}
 		element := s.blobCacheList.PushFront(entry)
 		s.blobCache[cacheKey] = element
 		s.blobCacheBytes += int64(len(copied))
@@ -1099,10 +1129,16 @@ func (s *Server) hostSemaphore(host string) chan struct{} {
 
 // isExpired 根据 CacheTTL 判断元数据是否过期。
 func (s *Server) isExpired(meta Meta) bool {
+	return s.isExpiredFromTime(meta.CreatedAt)
+}
+
+// isExpiredFromTime 根据给定时间戳判断缓存是否过期。
+// janitor 和预热可以直接复用 .meta 文件的修改时间，避免每次都先解码元数据。
+func (s *Server) isExpiredFromTime(createdAt time.Time) bool {
 	if s.cfg.CacheTTL <= 0 {
 		return false
 	}
-	return time.Since(meta.CreatedAt) > s.cfg.CacheTTL
+	return time.Since(createdAt) > s.cfg.CacheTTL
 }
 
 // cacheKey 用“标准化 URL + 变体”生成稳定的缓存键。
@@ -1122,9 +1158,9 @@ func (s *Server) blobPath(cacheKey string) string {
 	return filepath.Join(s.shardDir(cacheKey), cacheKey+".bin")
 }
 
-// metaPath 返回元数据 JSON 文件路径。
+// metaPath 返回紧凑元数据文件路径。
 func (s *Server) metaPath(cacheKey string) string {
-	return filepath.Join(s.shardDir(cacheKey), cacheKey+".json")
+	return filepath.Join(s.shardDir(cacheKey), cacheKey+currentMetaSuffix)
 }
 
 // defaultFetchOptions 给匿名抓取准备一套默认值。
@@ -1680,23 +1716,20 @@ func buildETag(cacheKey string, length int64, createdAt time.Time) string {
 	return fmt.Sprintf(`"%s-%d-%d"`, cacheKey[:16], length, createdAt.Unix())
 }
 
-// writeJSONAtomic 原子写入 JSON 文件。
-// 先写临时文件，再 rename 成正式文件，避免留下半截 JSON。
-func writeJSONAtomic(path string, value any) error {
+// writeMetaAtomic 原子写入紧凑的二进制元数据文件。
+// 这里不用 JSON，是为了减少 miss / revalidate / janitor 扫描时的编解码和磁盘字节量。
+func writeMetaAtomic(path string, meta Meta) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 
-	tmpFile, err := os.CreateTemp(dir, ".tmp-*.json")
+	tmpFile, err := os.CreateTemp(dir, ".tmp-*"+currentMetaSuffix)
 	if err != nil {
 		return err
 	}
 
-	encoder := json.NewEncoder(tmpFile)
-	encoder.SetEscapeHTML(false)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(value); err != nil {
+	if err := encodeMeta(tmpFile, meta); err != nil {
 		_ = tmpFile.Close()
 		_ = os.Remove(tmpFile.Name())
 		return err
@@ -1709,7 +1742,134 @@ func writeJSONAtomic(path string, value any) error {
 		_ = os.Remove(tmpFile.Name())
 		return err
 	}
+	if !meta.CreatedAt.IsZero() {
+		modTime := meta.CreatedAt.UTC()
+		if err := os.Chtimes(path, modTime, modTime); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// readMetaFile 解析紧凑二进制元数据文件。
+func readMetaFile(path string) (Meta, error) {
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return Meta{}, err
+	}
+	return decodeMeta(payload)
+}
+
+// encodeMeta 用长度前缀的二进制格式写入元数据。
+// 这比 JSON 更省字节，也避免 janitor / 预热时反复做通用反序列化。
+func encodeMeta(w io.Writer, meta Meta) error {
+	var buf bytes.Buffer
+	buf.WriteString(metaFileMagic)
+	for _, value := range []int64{meta.CreatedAt.UnixNano(), meta.Length} {
+		if err := binary.Write(&buf, binary.LittleEndian, value); err != nil {
+			return err
+		}
+	}
+	for _, value := range []string{
+		meta.SourceURL,
+		meta.ContentType,
+		meta.ETag,
+		meta.UpstreamETag,
+		meta.UpstreamLastModified,
+	} {
+		if err := writeMetaString(&buf, value); err != nil {
+			return err
+		}
+	}
+	_, err := w.Write(buf.Bytes())
+	return err
+}
+
+// decodeMeta 解析紧凑二进制元数据。
+func decodeMeta(payload []byte) (Meta, error) {
+	reader := bytes.NewReader(payload)
+	magic := make([]byte, len(metaFileMagic))
+	if _, err := io.ReadFull(reader, magic); err != nil {
+		return Meta{}, err
+	}
+	if string(magic) != metaFileMagic {
+		return Meta{}, fmt.Errorf("invalid meta magic")
+	}
+
+	var createdAtUnixNano int64
+	var length int64
+	if err := binary.Read(reader, binary.LittleEndian, &createdAtUnixNano); err != nil {
+		return Meta{}, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &length); err != nil {
+		return Meta{}, err
+	}
+
+	sourceURL, err := readMetaString(reader)
+	if err != nil {
+		return Meta{}, err
+	}
+	contentType, err := readMetaString(reader)
+	if err != nil {
+		return Meta{}, err
+	}
+	etag, err := readMetaString(reader)
+	if err != nil {
+		return Meta{}, err
+	}
+	upstreamETag, err := readMetaString(reader)
+	if err != nil {
+		return Meta{}, err
+	}
+	upstreamLastModified, err := readMetaString(reader)
+	if err != nil {
+		return Meta{}, err
+	}
+
+	if reader.Len() != 0 {
+		return Meta{}, fmt.Errorf("unexpected trailing meta bytes")
+	}
+	return Meta{
+		SourceURL:            sourceURL,
+		ContentType:          contentType,
+		Length:               length,
+		CreatedAt:            time.Unix(0, createdAtUnixNano).UTC(),
+		ETag:                 etag,
+		UpstreamETag:         upstreamETag,
+		UpstreamLastModified: upstreamLastModified,
+	}, nil
+}
+
+func writeMetaString(w io.Writer, value string) error {
+	var lenBuf [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(lenBuf[:], uint64(len(value)))
+	if _, err := w.Write(lenBuf[:n]); err != nil {
+		return err
+	}
+	_, err := io.WriteString(w, value)
+	return err
+}
+
+func readMetaString(r io.ByteReader) (string, error) {
+	size, err := binary.ReadUvarint(r)
+	if err != nil {
+		return "", err
+	}
+	if size == 0 {
+		return "", nil
+	}
+	if size > uint64(^uint(0)>>1) {
+		return "", fmt.Errorf("meta string too large: %d", size)
+	}
+	buf := make([]byte, int(size))
+	for i := range buf {
+		b, err := r.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		buf[i] = b
+	}
+	return string(buf), nil
 }
 
 // runJanitor 周期性执行缓存清理任务。
@@ -1744,6 +1904,8 @@ func (s *Server) runJanitorSweep() {
 }
 
 // cleanupExpiredFiles 只清理本轮选中的 shard 目录。
+// 这里不会递归 WalkDir，而是直接枚举 shard 目录中的 .meta 文件。
+// 原因是当前缓存布局固定为“两级 shard + 文件直落”，ReadDir 的成本更低。
 func (s *Server) cleanupExpiredFiles(shardDirs []string) {
 	removed := 0
 	if len(shardDirs) == 0 {
@@ -1751,37 +1913,27 @@ func (s *Server) cleanupExpiredFiles(shardDirs []string) {
 	}
 
 	for _, shardDir := range shardDirs {
-		_ = filepath.WalkDir(shardDir, func(path string, d os.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
-			if d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
-				return nil
-			}
-
-			payload, readErr := os.ReadFile(path)
-			if readErr != nil {
-				return nil
-			}
-
-			var meta Meta
-			if err := json.Unmarshal(payload, &meta); err != nil {
-				s.deleteMetaCache(cacheKeyFromMetaPath(path))
-				_ = os.Remove(path)
-				_ = os.Remove(strings.TrimSuffix(path, ".json") + ".bin")
+		listing, err := s.listShardFiles(shardDir)
+		if err != nil {
+			continue
+		}
+		for cacheKey, metaFile := range listing.MetaFiles {
+			if metaFile.InfoErr != nil {
+				s.deleteMetaCache(cacheKey)
+				_ = os.Remove(s.metaPath(cacheKey))
+				_ = os.Remove(s.blobPath(cacheKey))
 				removed++
-				return nil
+				continue
 			}
-			if !s.isExpired(meta) {
-				return nil
+			if !s.isExpiredFromTime(metaFile.Info.ModTime()) {
+				continue
 			}
 
-			s.deleteMetaCache(cacheKeyFromMetaPath(path))
-			_ = os.Remove(strings.TrimSuffix(path, ".json") + ".bin")
-			_ = os.Remove(path)
+			s.deleteMetaCache(cacheKey)
+			_ = os.Remove(s.blobPath(cacheKey))
+			_ = os.Remove(s.metaPath(cacheKey))
 			removed++
-			return nil
-		})
+		}
 	}
 
 	if removed > 0 {
@@ -1790,46 +1942,33 @@ func (s *Server) cleanupExpiredFiles(shardDirs []string) {
 }
 
 // scanCacheEntries 扫描整个缓存目录，收集容量清理需要的文件信息。
+// 这里刻意不解码每份 .meta，也不为每个条目提前拼 blob 路径，
+// 只保留容量淘汰真正需要的最小字段，尽量减少分配和字符串构造。
 func (s *Server) scanCacheEntries() ([]cacheEntry, int64, error) {
 	var entries []cacheEntry
 	var total int64
-
-	err := filepath.WalkDir(s.cfg.CacheDir, func(path string, d os.DirEntry, err error) error {
+	for _, shardDir := range s.listShardDirs() {
+		listing, err := s.listShardFiles(shardDir)
 		if err != nil {
-			return nil
+			continue
 		}
-		if d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
-			return nil
+		for cacheKey, metaFile := range listing.MetaFiles {
+			blobInfo, ok := listing.BlobFiles[cacheKey]
+			if !ok {
+				continue
+			}
+
+			entries = append(entries, cacheEntry{
+				Key:        cacheKey,
+				MetaPath:   metaFile.Path,
+				Length:     blobInfo.Size(),
+				ModifiedAt: blobInfo.ModTime(),
+			})
+			total += blobInfo.Size()
 		}
+	}
 
-		payload, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return nil
-		}
-
-		var meta Meta
-		if err := json.Unmarshal(payload, &meta); err != nil {
-			return nil
-		}
-
-		blobPath := strings.TrimSuffix(path, ".json") + ".bin"
-		stat, statErr := os.Stat(blobPath)
-		if statErr != nil {
-			return nil
-		}
-
-		entries = append(entries, cacheEntry{
-			Key:        strings.TrimSuffix(filepath.Base(path), ".json"),
-			BlobPath:   blobPath,
-			MetaPath:   path,
-			Length:     stat.Size(),
-			ModifiedAt: stat.ModTime(),
-		})
-		total += stat.Size()
-		return nil
-	})
-
-	return entries, total, err
+	return entries, total, nil
 }
 
 // cleanupOversizeCache 在总缓存大小超限时，按最旧文件优先淘汰。
@@ -1859,7 +1998,7 @@ func (s *Server) cleanupOversizeCache() {
 			break
 		}
 		s.deleteMetaCache(entry.Key)
-		_ = os.Remove(entry.BlobPath)
+		_ = os.Remove(s.blobPath(entry.Key))
 		_ = os.Remove(entry.MetaPath)
 		removedBytes += entry.Length
 		removedFiles++
@@ -2096,6 +2235,8 @@ func upstreamHeaderRulesEnv(key string) ([]UpstreamHeaderRule, error) {
 
 // warmMetaCache 启动后异步预热一部分磁盘元数据到内存 LRU。
 // 之所以异步做，是为了不阻塞服务启动。
+// 预热会先利用 .meta 文件时间过滤掉明显已过期的项，
+// 只有还可能有效的条目才会继续解码元数据并检查 blob 是否存在。
 func (s *Server) warmMetaCache(ctx context.Context, limit int) {
 	remaining := limit
 	if remaining == 0 {
@@ -2107,31 +2248,32 @@ func (s *Server) warmMetaCache(ctx context.Context, limit int) {
 			return
 		default:
 		}
-		_ = filepath.WalkDir(shardDir, func(path string, d os.DirEntry, err error) error {
-			if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
-				return nil
-			}
+		listing, err := s.listShardFiles(shardDir)
+		if err != nil {
+			continue
+		}
+		for cacheKey, metaFile := range listing.MetaFiles {
 			if remaining > 0 && s.metaCacheList.Len() >= remaining {
-				return io.EOF
+				return
 			}
-			cacheKey := cacheKeyFromMetaPath(path)
 			if _, ok := s.readMetaFromMemory(cacheKey); ok {
-				return nil
+				continue
 			}
-			payload, readErr := os.ReadFile(path)
+			if metaFile.InfoErr != nil {
+				continue
+			}
+			if s.isExpiredFromTime(metaFile.Info.ModTime()) {
+				continue
+			}
+			if _, ok := listing.BlobFiles[cacheKey]; !ok {
+				continue
+			}
+			meta, readErr := readMetaFile(metaFile.Path)
 			if readErr != nil {
-				return nil
-			}
-			var meta Meta
-			if err := json.Unmarshal(payload, &meta); err != nil {
-				return nil
-			}
-			if _, err := os.Stat(strings.TrimSuffix(path, ".json") + ".bin"); err != nil {
-				return nil
+				continue
 			}
 			s.writeMetaToMemory(cacheKey, meta)
-			return nil
-		})
+		}
 		if remaining > 0 && s.metaCacheLen() >= remaining {
 			return
 		}
@@ -2197,9 +2339,67 @@ func (s *Server) listShardDirs() []string {
 	return shards
 }
 
-// cacheKeyFromMetaPath 从 xxx.json 路径反推出缓存键。
+type metaFileInfo struct {
+	Path    string
+	Info    os.FileInfo
+	InfoErr error
+}
+
+type shardListing struct {
+	MetaFiles map[string]metaFileInfo
+	BlobFiles map[string]os.FileInfo
+}
+
+// listShardFiles 读取单个 shard 目录下的 meta/blob 文件清单。
+// 这里一次 ReadDir 把同目录里的信息收集好，避免预热和 janitor 再对每个 key 额外 stat。
+// 它是当前“枚举磁盘缓存”这条后台维护路线的核心辅助函数。
+func (s *Server) listShardFiles(shardDir string) (shardListing, error) {
+	entries, err := os.ReadDir(shardDir)
+	if err != nil {
+		return shardListing{}, err
+	}
+	listing := shardListing{
+		MetaFiles: make(map[string]metaFileInfo),
+		BlobFiles: make(map[string]os.FileInfo),
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		path := filepath.Join(shardDir, name)
+		info, infoErr := entry.Info()
+		switch {
+		case strings.HasSuffix(name, currentMetaSuffix):
+			cacheKey := cacheKeyFromMetaPath(path)
+			if cacheKey == "" {
+				continue
+			}
+			listing.MetaFiles[cacheKey] = metaFileInfo{
+				Path:    path,
+				Info:    info,
+				InfoErr: infoErr,
+			}
+		case strings.HasSuffix(name, ".bin"):
+			cacheKey := strings.TrimSuffix(name, ".bin")
+			if cacheKey == "" {
+				continue
+			}
+			if infoErr == nil {
+				listing.BlobFiles[cacheKey] = info
+			}
+		}
+	}
+	return listing, nil
+}
+
+// cacheKeyFromMetaPath 从 xxx.meta 路径反推出缓存键。
 func cacheKeyFromMetaPath(path string) string {
-	return strings.TrimSuffix(filepath.Base(path), ".json")
+	name := filepath.Base(path)
+	if !strings.HasSuffix(name, currentMetaSuffix) {
+		return ""
+	}
+	return strings.TrimSuffix(name, currentMetaSuffix)
 }
 
 // maxInt 返回两个整数中的较大值。

@@ -903,7 +903,7 @@ func TestRunRejectsDefaultAccessToken(t *testing.T) {
 }
 
 // TestConcurrentCacheHitsUseMemoryMetaCache 验证热点命中优先走内存元数据，
-// 而不是每次都去读磁盘上的 .json。
+// 而不是每次都去读磁盘上的 .meta。
 func TestConcurrentCacheHitsUseMemoryMetaCache(t *testing.T) {
 	var requests atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -963,6 +963,33 @@ func TestConcurrentCacheHitsUseMemoryMetaCache(t *testing.T) {
 	}
 }
 
+// TestMetaFileRoundTrip 验证新的紧凑元数据格式可以正确写回并读出。
+func TestMetaFileRoundTrip(t *testing.T) {
+	server := newTestServer(t)
+	cacheKey := strings.Repeat("a", 64)
+	want := Meta{
+		SourceURL:            "https://example.com/a.png",
+		ContentType:          "image/png",
+		Length:               12345,
+		CreatedAt:            time.Now().UTC().Truncate(time.Nanosecond),
+		ETag:                 "\"etag\"",
+		UpstreamETag:         "\"upstream-etag\"",
+		UpstreamLastModified: time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat),
+	}
+
+	if err := writeMetaAtomic(server.metaPath(cacheKey), want); err != nil {
+		t.Fatalf("writeMetaAtomic returned error: %v", err)
+	}
+
+	got, err := readMetaFile(server.metaPath(cacheKey))
+	if err != nil {
+		t.Fatalf("readMetaFile returned error: %v", err)
+	}
+	if got != want {
+		t.Fatalf("meta round trip mismatch: got %+v want %+v", got, want)
+	}
+}
+
 // TestHandleGetServesCachedBlobWithoutServeFile 验证热路径改成“自己打开缓存文件并流式返回”后，
 // 仍然能正确输出 body 和 Content-Length。
 func TestHandleGetServesCachedBlobWithoutServeFile(t *testing.T) {
@@ -983,8 +1010,8 @@ func TestHandleGetServesCachedBlobWithoutServeFile(t *testing.T) {
 	if err := os.WriteFile(server.blobPath(cacheKey), minimalPNG(), 0o644); err != nil {
 		t.Fatalf("WriteFile blob returned error: %v", err)
 	}
-	if err := writeJSONAtomic(server.metaPath(cacheKey), meta); err != nil {
-		t.Fatalf("writeJSONAtomic returned error: %v", err)
+	if err := writeMetaAtomic(server.metaPath(cacheKey), meta); err != nil {
+		t.Fatalf("writeMetaAtomic returned error: %v", err)
 	}
 	server.writeMetaToMemory(cacheKey, meta)
 
@@ -1025,8 +1052,8 @@ func TestHandleGetFreshHitSkipsEnsureCached(t *testing.T) {
 	if err := os.WriteFile(server.blobPath(cacheKey), body, 0o644); err != nil {
 		t.Fatalf("WriteFile blob returned error: %v", err)
 	}
-	if err := writeJSONAtomic(server.metaPath(cacheKey), meta); err != nil {
-		t.Fatalf("writeJSONAtomic returned error: %v", err)
+	if err := writeMetaAtomic(server.metaPath(cacheKey), meta); err != nil {
+		t.Fatalf("writeMetaAtomic returned error: %v", err)
 	}
 	server.writeMetaToMemory(cacheKey, meta)
 
@@ -1076,8 +1103,8 @@ func TestHandleGetCachesSmallBlobInMemory(t *testing.T) {
 	if err := os.WriteFile(server.blobPath(cacheKey), body, 0o644); err != nil {
 		t.Fatalf("WriteFile blob returned error: %v", err)
 	}
-	if err := writeJSONAtomic(server.metaPath(cacheKey), meta); err != nil {
-		t.Fatalf("writeJSONAtomic returned error: %v", err)
+	if err := writeMetaAtomic(server.metaPath(cacheKey), meta); err != nil {
+		t.Fatalf("writeMetaAtomic returned error: %v", err)
 	}
 	server.writeMetaToMemory(cacheKey, meta)
 
@@ -1146,8 +1173,8 @@ func TestEnsureCachedServesStaleAndRefreshesInBackground(t *testing.T) {
 		t.Fatal("expected cached meta")
 	}
 	meta.CreatedAt = time.Now().Add(-(server.cfg.CacheTTL + time.Minute)).UTC()
-	if err := writeJSONAtomic(server.metaPath(cacheKey), meta); err != nil {
-		t.Fatalf("writeJSONAtomic returned error: %v", err)
+	if err := writeMetaAtomic(server.metaPath(cacheKey), meta); err != nil {
+		t.Fatalf("writeMetaAtomic returned error: %v", err)
 	}
 	server.writeMetaToMemory(cacheKey, meta)
 	// 改一下上游 body，让后台刷新确实有新内容可写。
@@ -1217,8 +1244,8 @@ func TestEnsureCachedUsesConditionalRevalidation(t *testing.T) {
 	cacheKey := server.cacheKey(upstream.URL+"/etag.png", options.CacheVariant)
 	meta, _ := server.readMeta(cacheKey)
 	meta.CreatedAt = time.Now().Add(-2 * server.cfg.CacheTTL).UTC()
-	if err := writeJSONAtomic(server.metaPath(cacheKey), meta); err != nil {
-		t.Fatalf("writeJSONAtomic returned error: %v", err)
+	if err := writeMetaAtomic(server.metaPath(cacheKey), meta); err != nil {
+		t.Fatalf("writeMetaAtomic returned error: %v", err)
 	}
 	server.writeMetaToMemory(cacheKey, meta)
 	server.cfg.StaleGracePeriod = 0
@@ -1322,8 +1349,8 @@ func TestWarmMetaCacheLoadsDiskEntries(t *testing.T) {
 	if err := os.WriteFile(server.blobPath(cacheKey), minimalPNG(), 0o644); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
-	if err := writeJSONAtomic(server.metaPath(cacheKey), meta); err != nil {
-		t.Fatalf("writeJSONAtomic returned error: %v", err)
+	if err := writeMetaAtomic(server.metaPath(cacheKey), meta); err != nil {
+		t.Fatalf("writeMetaAtomic returned error: %v", err)
 	}
 
 	server.warmMetaCache(context.Background(), 1)
@@ -1357,8 +1384,8 @@ func TestCleanupExpiredFilesProcessesOnlySelectedShards(t *testing.T) {
 		if err := os.WriteFile(server.blobPath(cacheKey), minimalPNG(), 0o644); err != nil {
 			t.Fatalf("WriteFile returned error: %v", err)
 		}
-		if err := writeJSONAtomic(server.metaPath(cacheKey), meta); err != nil {
-			t.Fatalf("writeJSONAtomic returned error: %v", err)
+		if err := writeMetaAtomic(server.metaPath(cacheKey), meta); err != nil {
+			t.Fatalf("writeMetaAtomic returned error: %v", err)
 		}
 		return cacheKey
 	}
