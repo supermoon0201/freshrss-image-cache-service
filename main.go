@@ -144,6 +144,8 @@ type proactiveRequest struct {
 type fetchMode string
 
 const (
+	defaultAccessToken = "change-me"
+
 	// anonymous 表示完全匿名抓取，不额外补特殊请求头。
 	fetchModeAnonymous fetchMode = "anonymous"
 	// rule 表示命中了静态规则配置。
@@ -199,7 +201,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cfg := defaultConfig()
+	cfg, err := loadConfigFromEnv()
+	if err != nil {
+		log.Fatalf("load config failed: %v", err)
+	}
 	if err := run(ctx, cfg); err != nil {
 		log.Fatalf("run server failed: %v", err)
 	}
@@ -208,6 +213,9 @@ func main() {
 // run 负责把服务实例、后台任务和 HTTP Server 生命周期绑定到同一个 context。
 // 这样收到退出信号时，可以先停掉后台任务，再优雅关闭监听中的请求。
 func run(ctx context.Context, cfg Config) error {
+	if err := validateConfig(cfg); err != nil {
+		return fmt.Errorf("validate config: %w", err)
+	}
 	server, err := NewServer(cfg)
 	if err != nil {
 		return fmt.Errorf("init server: %w", err)
@@ -291,6 +299,7 @@ func NewServer(cfg Config) (*Server, error) {
 	cfg.BlobCacheEntries = normalizePositive(cfg.BlobCacheEntries, 256)
 	cfg.BlobCacheMaxBytes = normalizePositiveInt64(cfg.BlobCacheMaxBytes, 64<<20)
 	cfg.BlobFileMaxBytes = normalizePositiveInt64(cfg.BlobFileMaxBytes, 512<<10)
+	cfg.WarmMetaEntries = normalizePositive(cfg.WarmMetaEntries, 2048)
 	cfg.JanitorShardBatch = normalizePositive(cfg.JanitorShardBatch, 32)
 	// 这里显式放大连接池，避免高并发 miss 时卡在连接建立与复用上。
 	transport := &http.Transport{
@@ -1875,7 +1884,7 @@ func defaultConfig() Config {
 	return Config{
 		ListenAddr:          envOrDefault("LISTEN_ADDR", "127.0.0.1:9090"),
 		CacheDir:            envOrDefault("CACHE_DIR", "./data/cache"),
-		AccessToken:         envOrDefault("ACCESS_TOKEN", "change-me"),
+		AccessToken:         envOrDefault("ACCESS_TOKEN", defaultAccessToken),
 		FetchTimeout:        parseDurationOrDefault("FETCH_TIMEOUT", 15*time.Second),
 		MaxBodyBytes:        parseInt64OrDefault("MAX_BODY_BYTES", 20<<20), // 20MB
 		CacheTTL:            parseDurationOrDefault("CACHE_TTL", 30*24*time.Hour),
@@ -1895,6 +1904,111 @@ func defaultConfig() Config {
 		UpstreamHeaderRules: parseUpstreamHeaderRules("UPSTREAM_HEADER_RULES_JSON"),
 		CredentialedHosts:   parseCSVEnv("CREDENTIAL_FORWARD_HOSTS"),
 	}
+}
+
+// loadConfigFromEnv 用严格模式读取环境变量。
+// 启动阶段一旦发现格式错误，就直接返回错误而不是静默回退。
+func loadConfigFromEnv() (Config, error) {
+	accessToken, err := stringEnv("ACCESS_TOKEN", defaultAccessToken)
+	if err != nil {
+		return Config{}, err
+	}
+	fetchTimeout, err := durationEnv("FETCH_TIMEOUT", 15*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	maxBodyBytes, err := int64Env("MAX_BODY_BYTES", 20<<20)
+	if err != nil {
+		return Config{}, err
+	}
+	cacheTTL, err := durationEnv("CACHE_TTL", 30*24*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+	janitorInterval, err := durationEnv("JANITOR_INTERVAL", time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+	maxCacheBytes, err := int64Env("MAX_CACHE_BYTES", 10<<30)
+	if err != nil {
+		return Config{}, err
+	}
+	upstreamConcurrency, err := intEnv("UPSTREAM_CONCURRENCY", 64)
+	if err != nil {
+		return Config{}, err
+	}
+	perHostConcurrency, err := intEnv("UPSTREAM_CONCURRENCY_PER_HOST", 8)
+	if err != nil {
+		return Config{}, err
+	}
+	metaCacheEntries, err := intEnv("META_CACHE_ENTRIES", 4096)
+	if err != nil {
+		return Config{}, err
+	}
+	blobCacheEntries, err := intEnv("BLOB_CACHE_ENTRIES", 256)
+	if err != nil {
+		return Config{}, err
+	}
+	blobCacheMaxBytes, err := int64Env("BLOB_CACHE_MAX_BYTES", 64<<20)
+	if err != nil {
+		return Config{}, err
+	}
+	blobFileMaxBytes, err := int64Env("BLOB_FILE_MAX_BYTES", 512<<10)
+	if err != nil {
+		return Config{}, err
+	}
+	staleGracePeriod, err := durationEnv("STALE_GRACE_PERIOD", 10*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	warmMetaOnStart, err := boolEnv("WARM_META_ON_START", true)
+	if err != nil {
+		return Config{}, err
+	}
+	warmMetaEntries, err := intEnv("WARM_META_ENTRIES", 2048)
+	if err != nil {
+		return Config{}, err
+	}
+	janitorShardBatch, err := intEnv("JANITOR_SHARD_BATCH", 32)
+	if err != nil {
+		return Config{}, err
+	}
+	upstreamHeaderRules, err := upstreamHeaderRulesEnv("UPSTREAM_HEADER_RULES_JSON")
+	if err != nil {
+		return Config{}, err
+	}
+
+	return Config{
+		ListenAddr:          envOrDefault("LISTEN_ADDR", "127.0.0.1:9090"),
+		CacheDir:            envOrDefault("CACHE_DIR", "./data/cache"),
+		AccessToken:         accessToken,
+		FetchTimeout:        fetchTimeout,
+		MaxBodyBytes:        maxBodyBytes,
+		CacheTTL:            cacheTTL,
+		JanitorInterval:     janitorInterval,
+		MaxCacheBytes:       maxCacheBytes,
+		UpstreamConcurrency: upstreamConcurrency,
+		PerHostConcurrency:  perHostConcurrency,
+		MetaCacheEntries:    metaCacheEntries,
+		BlobCacheEntries:    blobCacheEntries,
+		BlobCacheMaxBytes:   blobCacheMaxBytes,
+		BlobFileMaxBytes:    blobFileMaxBytes,
+		StaleGracePeriod:    staleGracePeriod,
+		WarmMetaOnStart:     warmMetaOnStart,
+		WarmMetaEntries:     warmMetaEntries,
+		JanitorShardBatch:   janitorShardBatch,
+		AllowedSchemes:      map[string]struct{}{"http": {}, "https": {}},
+		UpstreamHeaderRules: upstreamHeaderRules,
+		CredentialedHosts:   parseCSVEnv("CREDENTIAL_FORWARD_HOSTS"),
+	}, nil
+}
+
+// validateConfig 在真正启动前兜底校验关键配置，防止带着危险默认值进入运行态。
+func validateConfig(cfg Config) error {
+	if strings.TrimSpace(cfg.AccessToken) == "" || cfg.AccessToken == defaultAccessToken {
+		return fmt.Errorf("ACCESS_TOKEN must be explicitly configured and must not use the default placeholder")
+	}
+	return nil
 }
 
 // normalizeUpstreamConcurrency 保证全局并发至少为 1。
@@ -1918,6 +2032,66 @@ func normalizePositiveInt64(value, fallback int64) int64 {
 		return fallback
 	}
 	return value
+}
+
+func stringEnv(key, defaultValue string) (string, error) {
+	return envOrDefault(key, defaultValue), nil
+}
+
+func durationEnv(key string, defaultValue time.Duration) (time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue, nil
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return parsed, nil
+}
+
+func int64Env(key string, defaultValue int64) (int64, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue, nil
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return parsed, nil
+}
+
+func intEnv(key string, defaultValue int) (int, error) {
+	parsed, err := int64Env(key, int64(defaultValue))
+	if err != nil {
+		return 0, err
+	}
+	return int(parsed), nil
+}
+
+func boolEnv(key string, defaultValue bool) (bool, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue, nil
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return parsed, nil
+}
+
+func upstreamHeaderRulesEnv(key string) ([]UpstreamHeaderRule, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return nil, nil
+	}
+	var rules []UpstreamHeaderRule
+	if err := json.Unmarshal([]byte(value), &rules); err != nil {
+		return nil, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return rules, nil
 }
 
 // warmMetaCache 启动后异步预热一部分磁盘元数据到内存 LRU。

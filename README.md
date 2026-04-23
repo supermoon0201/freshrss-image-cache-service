@@ -25,7 +25,7 @@
 | --- | --- | --- |
 | `LISTEN_ADDR` | `127.0.0.1:9090` | HTTP 监听地址 |
 | `CACHE_DIR` | `./data/cache` | 缓存根目录 |
-| `ACCESS_TOKEN` | `change-me` | 主动预热接口使用的访问令牌 |
+| `ACCESS_TOKEN` | `change-me` | 主动预热接口使用的访问令牌；这是占位值，启动前必须显式覆盖 |
 | `FETCH_TIMEOUT` | `15s` | 上游抓取超时时间 |
 | `MAX_BODY_BYTES` | `20971520` | 上游响应体最大字节数 |
 | `CACHE_TTL` | `720h` | 缓存过期时间 |

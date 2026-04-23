@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -691,6 +692,52 @@ func TestNewServerTunesTransportForHighConcurrency(t *testing.T) {
 	}
 }
 
+// TestLoadConfigFromEnvRejectsInvalidDuration 验证启动阶段遇到坏格式 duration 会直接报错，
+// 防止服务悄悄带着默认值启动。
+func TestLoadConfigFromEnvRejectsInvalidDuration(t *testing.T) {
+	t.Setenv("ACCESS_TOKEN", "test-token")
+	t.Setenv("FETCH_TIMEOUT", "15seconds???")
+
+	_, err := loadConfigFromEnv()
+	if err == nil {
+		t.Fatal("loadConfigFromEnv unexpectedly accepted invalid duration")
+	}
+	if !strings.Contains(err.Error(), "FETCH_TIMEOUT") {
+		t.Fatalf("loadConfigFromEnv error = %v, want FETCH_TIMEOUT context", err)
+	}
+}
+
+// TestLoadConfigFromEnvRejectsInvalidUpstreamHeaderRulesJSON 验证规则 JSON 配错时启动会失败，
+// 避免静默忽略导致线上行为和预期不一致。
+func TestLoadConfigFromEnvRejectsInvalidUpstreamHeaderRulesJSON(t *testing.T) {
+	t.Setenv("ACCESS_TOKEN", "test-token")
+	t.Setenv("UPSTREAM_HEADER_RULES_JSON", `[{]`)
+
+	_, err := loadConfigFromEnv()
+	if err == nil {
+		t.Fatal("loadConfigFromEnv unexpectedly accepted invalid upstream header rules json")
+	}
+	if !strings.Contains(err.Error(), "UPSTREAM_HEADER_RULES_JSON") {
+		t.Fatalf("loadConfigFromEnv error = %v, want UPSTREAM_HEADER_RULES_JSON context", err)
+	}
+}
+
+// TestNewServerNormalizesWarmMetaEntries 验证非法的预热条目上限会回退到默认值，
+// 防止负数把启动预热放大成“全量扫描”。
+func TestNewServerNormalizesWarmMetaEntries(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CacheDir = t.TempDir()
+	cfg.WarmMetaEntries = -1
+
+	server, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer returned error: %v", err)
+	}
+	if got := server.cfg.WarmMetaEntries; got != 2048 {
+		t.Fatalf("WarmMetaEntries = %d, want 2048", got)
+	}
+}
+
 // TestSafeDialContextUsesValidatedIPAddress 验证 safeDialContext 不会在校验后
 // 再把原始域名交给底层拨号，从而避免 DNS 重解析绕过 SSRF 防护。
 func TestSafeDialContextUsesValidatedIPAddress(t *testing.T) {
@@ -806,6 +853,7 @@ func TestRunShutsDownHTTPServerOnContextCancel(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.CacheDir = t.TempDir()
 	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.AccessToken = "test-token"
 	cfg.WarmMetaOnStart = false
 	cfg.JanitorInterval = time.Hour
 
@@ -836,6 +884,21 @@ func TestRunShutsDownHTTPServerOnContextCancel(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("run did not exit after shutdown")
+	}
+}
+
+// TestRunRejectsDefaultAccessToken 验证服务不会带着公开占位 token 启动。
+func TestRunRejectsDefaultAccessToken(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CacheDir = t.TempDir()
+	cfg.AccessToken = defaultAccessToken
+
+	err := run(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("run unexpectedly accepted default access token")
+	}
+	if !strings.Contains(err.Error(), "ACCESS_TOKEN") {
+		t.Fatalf("run error = %v, want ACCESS_TOKEN context", err)
 	}
 }
 
