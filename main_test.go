@@ -219,6 +219,9 @@ func TestHandleGetForwardsSafeHeadersAndCachesResult(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("first GET status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
+	if got := rec.Header().Get("Cache-Control"); got != "public, max-age=3600" {
+		t.Fatalf("first GET Cache-Control = %q, want public, max-age=3600", got)
+	}
 	if got := rec.Header().Get("X-Piccache-Status"); got != "MISS" {
 		t.Fatalf("first GET X-Piccache-Status = %q, want MISS", got)
 	}
@@ -367,6 +370,9 @@ func TestHandleHeadFetchesAndCachesWithoutBody(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("first HEAD status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "public, max-age=3600" {
+		t.Fatalf("first HEAD Cache-Control = %q, want public, max-age=3600", got)
 	}
 	if got := rec.Header().Get("X-Piccache-Status"); got != "MISS" {
 		t.Fatalf("first HEAD X-Piccache-Status = %q, want MISS", got)

@@ -364,7 +364,7 @@ func (s *Server) tryServeFreshCacheHit(cacheKey string) (cacheResult, bool) {
 // 这样 fast path 和常规路径可以共用一套输出逻辑，避免响应细节漂移。
 func (s *Server) writeReadResponse(w http.ResponseWriter, r *http.Request, cacheKey string, result cacheResult, headOnly bool) error {
 	w.Header().Set("Content-Type", result.Meta.ContentType)
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
 	if result.Meta.ETag != "" {
 		w.Header().Set("ETag", result.Meta.ETag)
 		if match := strings.TrimSpace(r.Header.Get("If-None-Match")); match == result.Meta.ETag {
