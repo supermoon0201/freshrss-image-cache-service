@@ -3,8 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -685,6 +688,154 @@ func TestNewServerTunesTransportForHighConcurrency(t *testing.T) {
 	}
 	if got := transport.MaxConnsPerHost; got != 64 {
 		t.Fatalf("MaxConnsPerHost = %d, want 64", got)
+	}
+}
+
+// TestSafeDialContextUsesValidatedIPAddress 验证 safeDialContext 不会在校验后
+// 再把原始域名交给底层拨号，从而避免 DNS 重解析绕过 SSRF 防护。
+func TestSafeDialContextUsesValidatedIPAddress(t *testing.T) {
+	originalLookup := lookupNetIP
+	originalDial := dialContext
+	t.Cleanup(func() {
+		lookupNetIP = originalLookup
+		dialContext = originalDial
+	})
+
+	lookupNetIP = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+		if network != "ip" {
+			t.Fatalf("lookup network = %q, want ip", network)
+		}
+		if host != "example.com" {
+			t.Fatalf("lookup host = %q, want example.com", host)
+		}
+		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+	}
+
+	var dialAddress string
+	dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dialAddress = address
+		return nil, errors.New("stop after capture")
+	}
+
+	_, err := safeDialContext(context.Background(), "tcp", "example.com:443")
+	if err == nil || err.Error() != "stop after capture" {
+		t.Fatalf("safeDialContext error = %v, want injected dial error", err)
+	}
+	if dialAddress != "93.184.216.34:443" {
+		t.Fatalf("dial address = %q, want 93.184.216.34:443", dialAddress)
+	}
+}
+
+// TestSafeDialContextRejectsPrivateAddress 验证解析结果里只要是私网地址就直接拒绝，
+// 不会继续进入实际拨号。
+func TestSafeDialContextRejectsPrivateAddress(t *testing.T) {
+	originalLookup := lookupNetIP
+	originalDial := dialContext
+	t.Cleanup(func() {
+		lookupNetIP = originalLookup
+		dialContext = originalDial
+	})
+
+	lookupNetIP = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	}
+
+	dialCalled := false
+	dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dialCalled = true
+		return nil, errors.New("unexpected dial")
+	}
+
+	_, err := safeDialContext(context.Background(), "tcp", "localhost:80")
+	if !errors.Is(err, errPrivateAddress) {
+		t.Fatalf("safeDialContext error = %v, want errPrivateAddress", err)
+	}
+	if dialCalled {
+		t.Fatal("dialContext was called for private address")
+	}
+}
+
+// TestRunJanitorStopsOnContextCancel 验证后台 janitor 能在 context 取消后及时退出，
+// 为优雅停机提供基本保障。
+func TestRunJanitorStopsOnContextCancel(t *testing.T) {
+	server := newTestServer(t)
+	server.cfg.JanitorInterval = 10 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server.runJanitor(ctx)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("runJanitor did not stop after context cancellation")
+	}
+}
+
+// TestRunShutsDownHTTPServerOnContextCancel 验证 run(ctx, cfg) 在 context 取消时
+// 会触发 HTTP server 的 Shutdown，并在合理时间内正常退出。
+func TestRunShutsDownHTTPServerOnContextCancel(t *testing.T) {
+	originalServeHTTP := serveHTTP
+	originalShutdownHTTP := shutdownHTTP
+	t.Cleanup(func() {
+		serveHTTP = originalServeHTTP
+		shutdownHTTP = originalShutdownHTTP
+	})
+
+	listenStarted := make(chan struct{})
+	shutdownCalled := make(chan struct{})
+	serveReleased := make(chan struct{})
+
+	serveHTTP = func(server *http.Server) error {
+		close(listenStarted)
+		<-serveReleased
+		return http.ErrServerClosed
+	}
+	shutdownHTTP = func(server *http.Server, ctx context.Context) error {
+		close(shutdownCalled)
+		close(serveReleased)
+		return nil
+	}
+
+	cfg := defaultConfig()
+	cfg.CacheDir = t.TempDir()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.WarmMetaOnStart = false
+	cfg.JanitorInterval = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(ctx, cfg)
+	}()
+
+	select {
+	case <-listenStarted:
+	case <-time.After(time.Second):
+		t.Fatal("run did not start HTTP serving")
+	}
+
+	cancel()
+
+	select {
+	case <-shutdownCalled:
+	case <-time.After(time.Second):
+		t.Fatal("run did not call Shutdown after context cancellation")
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("run returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("run did not exit after shutdown")
 	}
 }
 

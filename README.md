@@ -11,12 +11,13 @@
 - 支持按域名配置上游请求头，例如 `Referer`、`Origin`、`User-Agent`、`Accept-Language`
 - 支持 `POST /piccache` 受控透传白名单请求头到上游，适配需要登录态或动态 `Referer` 的图片源
 - 支持 `GET /piccache` 从当前请求继承非敏感白名单头到上游；若未提供 `Referer` / `Origin`，会从目标 URL 自动推导并在 403 时有限回退
-- 内置 SSRF 防护，拒绝访问私网、回环、链路本地、多播和未指定地址
+- 内置 SSRF 防护，解析目标 host 后会先校验每个 IP，再仅连接已验证通过的 IP，拒绝访问私网、回环、链路本地、多播和未指定地址
 - 采用磁盘分片缓存，并支持 TTL 过期清理和最大容量淘汰
 - 命中路径使用进程内元数据 LRU，减少高并发读盘
 - 支持过期缓存 `stale-while-revalidate`，优先返回旧内容并后台刷新
 - 支持启动后异步预热元数据和按 shard 渐进式 janitor 清理
 - 支持条件回源校验和单 host 并发限制，降低热点回源压力
+- 支持优雅停机，收到 `SIGINT` / `SIGTERM` 后会先停止后台预热与 janitor，再在超时窗口内关闭 HTTP 服务
 
 ## 环境变量
 
@@ -171,8 +172,13 @@
    这是这个服务适配很多图片源时比较有特色的一块。
 
 10. 最后看后台任务和工具函数
-   收尾时再看 `warmMetaCache()`、`runJanitor()`、`cleanupExpiredFiles()`、`cleanupOversizeCache()` 以及下面的解析工具函数。
-   这时你已经知道主流程了，再看这些辅助逻辑会容易很多。
+    收尾时再看 `warmMetaCache()`、`runJanitor()`、`cleanupExpiredFiles()`、`cleanupOversizeCache()` 以及下面的解析工具函数。
+    这时你已经知道主流程了，再看这些辅助逻辑会容易很多。
+
+11. 最后补看安全边界和生命周期
+    建议再看 `safeDialContext()` 和 `run()`。
+    前者负责把“DNS 解析后的 IP 校验”和“实际 TCP 连接”绑在一起，避免 DNS 重解析绕过 SSRF 防护；
+    后者负责把 HTTP 服务、预热任务和 janitor 绑定到同一个可取消 context 上，实现优雅停机。
 
 如果你想结合测试一起看，推荐这样配对：
 
@@ -266,6 +272,11 @@ go run .
 go test ./...
 ```
 
+最近新增了两类回归测试，后续改动这两块逻辑时建议优先关注：
+
+- `TestSafeDialContextUsesValidatedIPAddress`、`TestSafeDialContextRejectsPrivateAddress`
+- `TestRunJanitorStopsOnContextCancel`
+
 ## Docker 构建与运行
 
 ```bash
@@ -276,6 +287,8 @@ docker run --rm -p 9090:9090 freshrss-image-cache-service
 当前 Docker 构建阶段使用 Go 1.25，与仓库中的 `go.mod` 版本要求保持一致。
 
 容器启动时会先尝试修复 `CACHE_DIR` 的目录权限，再以 `app` 用户启动主程序。这可以改善宿主机绑定挂载目录时的权限兼容性；如果宿主机启用了更严格的文件系统或安全策略，仍可能需要手动调整目录属主或改用 Docker 命名卷。
+
+服务已支持优雅停机：收到 `SIGINT` / `SIGTERM` 后，会先取消后台预热和 janitor，再调用 `http.Server.Shutdown()` 给进行中的 HTTP 请求一个有限收口窗口。默认实现使用 10 秒超时；如果请求长时间卡住或上游持续无响应，超过这个窗口后进程仍会退出。
 
 ## GitHub 自动构建镜像
 

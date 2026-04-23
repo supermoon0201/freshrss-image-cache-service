@@ -17,11 +17,13 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/publicsuffix"
@@ -176,23 +178,59 @@ var (
 	errPrivateAddress      = errors.New("target resolves to private or loopback address")
 	errUnexpectedMediaType = errors.New("upstream response is not an image or video")
 	errUpstreamChallenge   = errors.New("upstream returned a likely challenge page")
+
+	lookupNetIP = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+		return net.DefaultResolver.LookupNetIP(ctx, network, host)
+	}
+	dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, network, address)
+	}
+	serveHTTP = func(server *http.Server) error {
+		return server.ListenAndServe()
+	}
+	shutdownHTTP = func(server *http.Server, ctx context.Context) error {
+		return server.Shutdown(ctx)
+	}
 )
 
 // main 负责组装配置、初始化服务，并启动 HTTP 监听与后台任务。
 func main() {
-	cfg := defaultConfig()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
+	cfg := defaultConfig()
+	if err := run(ctx, cfg); err != nil {
+		log.Fatalf("run server failed: %v", err)
+	}
+}
+
+// run 负责把服务实例、后台任务和 HTTP Server 生命周期绑定到同一个 context。
+// 这样收到退出信号时，可以先停掉后台任务，再优雅关闭监听中的请求。
+func run(ctx context.Context, cfg Config) error {
 	server, err := NewServer(cfg)
 	if err != nil {
-		log.Fatalf("init server failed: %v", err)
+		return fmt.Errorf("init server: %w", err)
 	}
 
+	backgroundCtx, cancelBackground := context.WithCancel(ctx)
+	defer cancelBackground()
+
+	var backgroundWG sync.WaitGroup
 	// 预热和 janitor 都放在后台 goroutine 中做，
 	// 这样服务可以先开始监听，再慢慢恢复热数据和清理任务。
 	if cfg.WarmMetaOnStart {
-		go server.warmMetaCache(context.Background(), cfg.WarmMetaEntries)
+		backgroundWG.Add(1)
+		go func() {
+			defer backgroundWG.Done()
+			server.warmMetaCache(backgroundCtx, cfg.WarmMetaEntries)
+		}()
 	}
-	go server.runJanitor(context.Background())
+	backgroundWG.Add(1)
+	go func() {
+		defer backgroundWG.Done()
+		server.runJanitor(backgroundCtx)
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", server.handleHealth)
@@ -204,9 +242,38 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	log.Printf("piccache listening on %s", cfg.ListenAddr)
-	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("listen failed: %v", err)
+	serverErrCh := make(chan error, 1)
+	go func() {
+		log.Printf("piccache listening on %s", cfg.ListenAddr)
+		if err := serveHTTP(httpServer); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErrCh <- err
+			return
+		}
+		serverErrCh <- nil
+	}()
+
+	select {
+	case <-ctx.Done():
+		cancelBackground()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		shutdownErr := shutdownHTTP(httpServer, shutdownCtx)
+		backgroundWG.Wait()
+		listenErr := <-serverErrCh
+		if shutdownErr != nil {
+			return fmt.Errorf("shutdown server: %w", shutdownErr)
+		}
+		if listenErr != nil {
+			return fmt.Errorf("listen server: %w", listenErr)
+		}
+		return nil
+	case err := <-serverErrCh:
+		cancelBackground()
+		backgroundWG.Wait()
+		if err != nil {
+			return fmt.Errorf("listen server: %w", err)
+		}
+		return nil
 	}
 }
 
@@ -522,8 +589,8 @@ func (s *Server) fetchAndStore(ctx context.Context, normalizedURL string, option
 	defer resp.Body.Close()
 
 	cacheVariant := options.CacheVariant
-		if cacheVariant == "" {
-			cacheVariant = buildSharedCacheVariant(usedHeaders)
+	if cacheVariant == "" {
+		cacheVariant = buildSharedCacheVariant(usedHeaders)
 	}
 	cacheKey := s.cacheKey(normalizedURL, cacheVariant)
 
@@ -1498,7 +1565,7 @@ func safeDialContext(ctx context.Context, network, address string) (net.Conn, er
 		port = "80"
 	}
 
-	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	ips, err := lookupNetIP(ctx, "ip", host)
 	if err != nil {
 		return nil, err
 	}
@@ -1508,8 +1575,18 @@ func safeDialContext(ctx context.Context, network, address string) (net.Conn, er
 		}
 	}
 
-	var dialer net.Dialer
-	return dialer.DialContext(ctx, network, net.JoinHostPort(host, port))
+	var lastErr error
+	for _, ip := range ips {
+		conn, dialErr := dialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if dialErr == nil {
+			return conn, nil
+		}
+		lastErr = dialErr
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("no resolved address for host %q", host)
 }
 
 // isPrivateOrLoopback 判断某个 IP 是否属于不允许访问的内网或特殊地址。
