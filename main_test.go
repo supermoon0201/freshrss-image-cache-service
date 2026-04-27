@@ -1406,6 +1406,61 @@ func TestCleanupExpiredFilesProcessesOnlySelectedShards(t *testing.T) {
 	}
 }
 
+// TestCleanupExpiredFilesOnStartProcessesAllShards 验证启动清理会全量处理所有 shard。
+// 即使常规 janitor 被配置成每轮只扫 1 个 shard，容器启动后的这次清理也应尽快清空所有过期项。
+func TestCleanupExpiredFilesOnStartProcessesAllShards(t *testing.T) {
+	server := newTestServer(t)
+	server.cfg.JanitorShardBatch = 1
+
+	makeEntry := func(rawURL string, createdAt time.Time) string {
+		options := server.resolveFetchOptions(rawURL, upstreamFetchOptions{})
+		cacheKey := server.cacheKey(rawURL, options.CacheVariant)
+		meta := Meta{
+			SourceURL:   rawURL,
+			ContentType: "image/png",
+			Length:      int64(len(minimalPNG())),
+			CreatedAt:   createdAt.UTC(),
+			ETag:        buildETag(cacheKey, int64(len(minimalPNG())), createdAt.UTC()),
+		}
+		if err := os.MkdirAll(filepath.Dir(server.blobPath(cacheKey)), 0o755); err != nil {
+			t.Fatalf("MkdirAll returned error: %v", err)
+		}
+		if err := os.WriteFile(server.blobPath(cacheKey), minimalPNG(), 0o644); err != nil {
+			t.Fatalf("WriteFile returned error: %v", err)
+		}
+		if err := writeMetaAtomic(server.metaPath(cacheKey), meta); err != nil {
+			t.Fatalf("writeMetaAtomic returned error: %v", err)
+		}
+		return cacheKey
+	}
+
+	expiredAt := time.Now().Add(-2 * server.cfg.CacheTTL)
+	freshAt := time.Now()
+	expiredA := makeEntry("https://example.com/startup-a.png", expiredAt)
+	expiredB := makeEntry("https://another.example.com/startup-b.png", expiredAt)
+	fresh := makeEntry("https://fresh.example.com/startup-c.png", freshAt)
+	if len(server.listShardDirs()) < 2 {
+		t.Fatalf("expected at least two shards, got %d", len(server.listShardDirs()))
+	}
+
+	server.cleanupExpiredFilesOnStart()
+
+	for _, cacheKey := range []string{expiredA, expiredB} {
+		if _, err := os.Stat(server.metaPath(cacheKey)); !os.IsNotExist(err) {
+			t.Fatalf("expected expired meta %s to be removed, stat err = %v", cacheKey, err)
+		}
+		if _, err := os.Stat(server.blobPath(cacheKey)); !os.IsNotExist(err) {
+			t.Fatalf("expected expired blob %s to be removed, stat err = %v", cacheKey, err)
+		}
+	}
+	if _, err := os.Stat(server.metaPath(fresh)); err != nil {
+		t.Fatalf("expected fresh meta to remain, stat err = %v", err)
+	}
+	if _, err := os.Stat(server.blobPath(fresh)); err != nil {
+		t.Fatalf("expected fresh blob to remain, stat err = %v", err)
+	}
+}
+
 // newTestServer 为测试创建一套尽量轻量、但行为接近生产的 Server。
 // 它会走真实的 NewServer，避免测试绕过初始化逻辑。
 func newTestServer(t *testing.T) *Server {

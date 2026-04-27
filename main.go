@@ -54,6 +54,7 @@ type Config struct {
 	WarmMetaOnStart     bool
 	WarmMetaEntries     int
 	JanitorShardBatch   int
+	CleanExpiredOnStart bool
 	AllowedSchemes      map[string]struct{}
 	UpstreamHeaderRules []UpstreamHeaderRule
 	CredentialedHosts   []string
@@ -245,6 +246,9 @@ func run(ctx context.Context, cfg Config) error {
 	backgroundWG.Add(1)
 	go func() {
 		defer backgroundWG.Done()
+		if cfg.CleanExpiredOnStart {
+			server.cleanupExpiredFilesOnStart()
+		}
 		server.runJanitor(backgroundCtx)
 	}()
 
@@ -1893,6 +1897,13 @@ func (s *Server) runJanitor(ctx context.Context) {
 	}
 }
 
+// cleanupExpiredFilesOnStart 在服务启动后做一次全量过期清理。
+// 平时 janitor 会按 shard 分批扫描，避免长期运行时产生过大的磁盘 I/O；
+// 但容器刚启动时，用户通常期望旧的过期缓存能尽快被清掉，所以这里显式扫一遍全部 shard。
+func (s *Server) cleanupExpiredFilesOnStart() {
+	s.cleanupExpiredFiles(s.listShardDirs())
+}
+
 // runJanitorSweep 执行一次 janitor 轮次。
 // 过期清理按 shard 分批做，容量清理则在一轮扫完后再统一做。
 func (s *Server) runJanitorSweep() {
@@ -2039,6 +2050,7 @@ func defaultConfig() Config {
 		WarmMetaOnStart:     parseBoolOrDefault("WARM_META_ON_START", true),
 		WarmMetaEntries:     int(parseInt64OrDefault("WARM_META_ENTRIES", 2048)),
 		JanitorShardBatch:   int(parseInt64OrDefault("JANITOR_SHARD_BATCH", 32)),
+		CleanExpiredOnStart: parseBoolOrDefault("CLEAN_EXPIRED_ON_START", true),
 		AllowedSchemes:      map[string]struct{}{"http": {}, "https": {}},
 		UpstreamHeaderRules: parseUpstreamHeaderRules("UPSTREAM_HEADER_RULES_JSON"),
 		CredentialedHosts:   parseCSVEnv("CREDENTIAL_FORWARD_HOSTS"),
@@ -2112,6 +2124,10 @@ func loadConfigFromEnv() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	cleanExpiredOnStart, err := boolEnv("CLEAN_EXPIRED_ON_START", true)
+	if err != nil {
+		return Config{}, err
+	}
 	upstreamHeaderRules, err := upstreamHeaderRulesEnv("UPSTREAM_HEADER_RULES_JSON")
 	if err != nil {
 		return Config{}, err
@@ -2136,6 +2152,7 @@ func loadConfigFromEnv() (Config, error) {
 		WarmMetaOnStart:     warmMetaOnStart,
 		WarmMetaEntries:     warmMetaEntries,
 		JanitorShardBatch:   janitorShardBatch,
+		CleanExpiredOnStart: cleanExpiredOnStart,
 		AllowedSchemes:      map[string]struct{}{"http": {}, "https": {}},
 		UpstreamHeaderRules: upstreamHeaderRules,
 		CredentialedHosts:   parseCSVEnv("CREDENTIAL_FORWARD_HOSTS"),

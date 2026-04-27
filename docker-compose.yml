@@ -24,6 +24,7 @@ services:
       WARM_META_ON_START: "true"
       WARM_META_ENTRIES: 2048
       JANITOR_SHARD_BATCH: 32
+      CLEAN_EXPIRED_ON_START: "true"
     volumes:
       - ./data/cache:/data/cache
     healthcheck:

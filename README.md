@@ -85,6 +85,7 @@ cache/
 | `WARM_META_ON_START` | `true` | 启动后是否异步预热磁盘元数据到内存 |
 | `WARM_META_ENTRIES` | `2048` | 启动预热最多加载的元数据条目数 |
 | `JANITOR_SHARD_BATCH` | `32` | 每轮 janitor 扫描的 shard 目录数量 |
+| `CLEAN_EXPIRED_ON_START` | `true` | 启动后是否异步全量清理已过期缓存 |
 | `UPSTREAM_HEADER_RULES_JSON` | 空 | 按域名匹配的上游请求头规则，JSON 数组 |
 | `CREDENTIAL_FORWARD_HOSTS` | 空 | 允许通过 `POST /piccache` 透传 `Cookie`/`Authorization` 的域名白名单，逗号分隔，支持 `*.example.com` |
 
